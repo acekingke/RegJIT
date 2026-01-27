@@ -13,13 +13,16 @@
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/InitLLVM.h>
 #include <llvm/Support/TargetSelect.h>
+#include <llvm/Support/Process.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/Target/TargetMachine.h>
 
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Analysis/LoopAnalysisManager.h>
 #include <llvm/Analysis/CGSCCPassManager.h>
 #include <llvm/Passes/OptimizationLevel.h>
+
 using namespace llvm;
 using namespace llvm::orc;
 
@@ -101,10 +104,46 @@ class Root {
     Value* CodeGen() override;
     ~Repeat() override = default;
   };
-  void Initialize();
-  void Compile();
-  void CompileRegex(const std::string& pattern);
-  int Execute(const char* input);
+
+  // Character class
+  class CharClass: public Root {
+    public:
+    struct CharRange {
+        char start;
+        char end;
+        bool included;
+        
+        CharRange(char s, char e, bool inc = true) : start(s), end(e), included(inc) {}
+    };
+    
+    private:
+    std::vector<CharRange> ranges;
+    bool negated;
+    bool dotClass;
+    
+    public:
+    explicit CharClass(bool neg = false, bool dot = false) : negated(neg), dotClass(dot) {}
+    
+    void addRange(char start, char end, bool included = true) {
+        ranges.emplace_back(start, end, included);
+    }
+    
+    void addChar(char c, bool included = true) {
+        ranges.emplace_back(c, c, included);
+    }
+    
+    bool isNegated() const { return negated; }
+    bool isDotClass() const { return dotClass; }
+    const std::vector<CharRange>& getRanges() const { return ranges; }
+    
+    Value* CodeGen() override;
+    ~CharClass() override = default;
+  };
+void Initialize();
+void Compile();
+void CompileRegex(const std::string& pattern);
+int Execute(const char* input);
+void CleanUp();
 
 
 

@@ -3,7 +3,7 @@
   ExitOnError ExitOnErr;
   LLVMContext Context;
   IRBuilder<> Builder(Context);
-  std::unique_ptr<Module>ThisModule = std::make_unique<Module>("my_module", Context);;
+  std::unique_ptr<Module>ThisModule = nullptr;
   std::unique_ptr<llvm::orc::LLJIT> JIT;
   llvm::orc::ResourceTrackerSP RT;
   Function *MatchF;
@@ -16,9 +16,17 @@
   
 
 void Initialize() {
+   ThisModule =  std::make_unique<Module>("my_module", Context);
     InitializeNativeTarget();
     InitializeNativeTargetAsmPrinter();
     JIT = ExitOnErr(LLJITBuilder().create());
+    ThisModule->setDataLayout(JIT->getDataLayout());
+  
+  if (verifyModule(*ThisModule, &errs())) {
+    errs() << "Error verifying module!\n";
+    return;
+  }
+
 }
 
 // Add optimization passes
@@ -45,10 +53,7 @@ void OptimizeModule(Module& M) {
 
 // Modified Compile function
 void Compile() {
- if (verifyModule(*ThisModule, &errs())) {
-    errs() << "Error verifying module!\n";
-    return;
-  }
+  // Set data layout for the target
 
   outs() << "\nGenerated LLVM IR:\n";
   ThisModule->print(outs(), nullptr);
@@ -65,7 +70,12 @@ void Compile() {
     ThreadSafeModule(std::move(ThisModule), SafeCtx)));
 }
 void CleanUp() {
-  ExitOnErr(RT->remove());
+  if (RT) {
+    ExitOnErr(RT->remove());
+    RT = nullptr;
+  }
+  // Note: We don't delete JIT here as it might be reused
+  // JIT resources will be cleaned up when the JIT object is destroyed
 }
 int Execute(const char* input) {
   auto MatchSym = ExitOnErr(JIT->lookup("match"));
@@ -219,7 +229,7 @@ Value* Repeat::CodeGen() {
         Value* newIdx = Builder.CreateAdd(curIdx, ConstantInt::get(Context, APInt(32, 1)));
         Builder.CreateStore(newIdx, Index);
         Builder.CreateBr(loopBlock);
-
+        
         // Exit block - continue to success
         Builder.SetInsertPoint(exitBlock);
         // Rollback index on failure
@@ -266,7 +276,8 @@ Value* Repeat::CodeGen() {
     else if(times > 0) { // Exact count
         Value* counter = Builder.CreateAlloca(Builder.getInt32Ty());
         Builder.CreateStore(ConstantInt::get(Context, APInt(32, 0)), counter);
-        
+        Value* count = Builder.CreateLoad(Builder.getInt32Ty(), counter);
+        Value* InitVal = Builder.CreateLoad(Builder.getInt32Ty(), Index);
         BasicBlock* checkBlock = BasicBlock::Create(Context, "repeat_check", MatchF);
         BasicBlock* loopBlock = BasicBlock::Create(Context, "repeat_loop", MatchF);
         BasicBlock* bodySuccess = BasicBlock::Create(Context, "repeat_success", MatchF);
@@ -276,10 +287,12 @@ Value* Repeat::CodeGen() {
         
         // Check iteration count
         Builder.SetInsertPoint(checkBlock);
-        Value* count = Builder.CreateLoad(Builder.getInt32Ty(), counter);
-        Value* cond = Builder.CreateICmpSLT(count, 
+        PHINode *countPhi = Builder.CreatePHI(Type::getInt32Ty(Context), 2, "phi_node2");
+        countPhi->addIncoming(count, origBlock);
+        Value* cond = Builder.CreateICmpSLT(countPhi, 
             ConstantInt::get(Context, APInt(32, times)));
         Builder.CreateCondBr(cond, loopBlock, exitBlock);
+   
 
         // Loop block
         Builder.SetInsertPoint(loopBlock);
@@ -293,8 +306,9 @@ Value* Repeat::CodeGen() {
         Value* newIdx = Builder.CreateAdd(curIdx, ConstantInt::get(Context, APInt(32, 1)));
         Builder.CreateStore(newIdx, Index);
         
-        Value* newCount = Builder.CreateAdd(count, ConstantInt::get(Context, APInt(32, 1)));
-        Builder.CreateStore(newCount, counter);
+        Value* newCount = Builder.CreateAdd(countPhi, ConstantInt::get(Context, APInt(32, 1)));
+        countPhi->addIncoming(newCount, bodySuccess);
+        //Builder.CreateStore(newCount, counter);
         Builder.CreateBr(checkBlock);
 
         // Exit block
@@ -332,7 +346,12 @@ public:
         PIPE,   // |
         LPAREN, // (
         RPAREN, // )
-        EOS     // End of string
+        LBRACKET, // [
+        RBRACKET, // ]
+        DASH,    // -
+        CARET,   // ^
+        DOT,     // .
+        EOS      // End of string
     };
 
     struct Token {
@@ -349,6 +368,11 @@ public:
                 case '|': next(); return {PIPE, '|'};
                 case '(': next(); return {LPAREN, '('};
                 case ')': next(); return {RPAREN, ')'};
+                case '[': next(); return {LBRACKET, '['};
+                case ']': next(); return {RBRACKET, ']'};
+                case '-': next(); return {DASH, '-'};
+                case '^': next(); return {CARET, '^'};
+                case '.': next(); return {DOT, '.'};
                 case '\\': { // Handle escape characters
                     next();
                     char c = current();
@@ -371,6 +395,53 @@ class RegexParser {
     RegexLexer& m_lexer;
     RegexLexer::Token m_cur_token;
 
+    std::unique_ptr<Root> parse_character_class() {
+        // Skip opening bracket
+        m_cur_token = m_lexer.get_next_token();
+        
+        bool negated = false;
+        if (m_cur_token.type == RegexLexer::CARET) {
+            negated = true;
+            m_cur_token = m_lexer.get_next_token();
+        }
+        
+        auto charClass = std::make_unique<CharClass>(negated, false);
+        
+        // Parse characters and ranges
+        while (m_cur_token.type != RegexLexer::RBRACKET) {
+            if (m_cur_token.type == RegexLexer::EOS) {
+                throw std::runtime_error("Unclosed character class");
+            }
+            
+            if (m_cur_token.type == RegexLexer::CHAR) {
+                char startChar = m_cur_token.value;
+                m_cur_token = m_lexer.get_next_token();
+                
+                // Check for range
+                if (m_cur_token.type == RegexLexer::DASH) {
+                    m_cur_token = m_lexer.get_next_token();
+                    if (m_cur_token.type != RegexLexer::CHAR) {
+                        throw std::runtime_error("Invalid range in character class");
+                    }
+                    char endChar = m_cur_token.value;
+                    m_cur_token = m_lexer.get_next_token();
+                    
+                    // Add range
+                    charClass->addRange(startChar, endChar, true);
+                } else {
+                    // Add single character
+                    charClass->addChar(startChar, true);
+                }
+            } else {
+                throw std::runtime_error("Unexpected token in character class");
+            }
+        }
+        
+        // Skip closing bracket
+        m_cur_token = m_lexer.get_next_token();
+        return charClass;
+    }
+
     std::unique_ptr<Root> parse_element() {
         if (m_cur_token.type == RegexLexer::LPAREN) {
             m_cur_token = m_lexer.get_next_token();
@@ -380,6 +451,11 @@ class RegexParser {
             }
             m_cur_token = m_lexer.get_next_token();
             return expr;
+        } else if (m_cur_token.type == RegexLexer::DOT) {
+            m_cur_token = m_lexer.get_next_token();
+            return std::make_unique<CharClass>(false, true); // dot class
+        } else if (m_cur_token.type == RegexLexer::LBRACKET) {
+            return parse_character_class();
         } else if (m_cur_token.type == RegexLexer::CHAR) {
             char c = m_cur_token.value;
             m_cur_token = m_lexer.get_next_token();
@@ -451,6 +527,64 @@ public:
         return parse_expr();
     }
 };
+
+// CharClass implementation
+Value* CharClass::CodeGen() {
+    // Load current character from input
+    Value* curIdx = Builder.CreateLoad(Builder.getInt32Ty(), Index);
+    Value* charPtr = Builder.CreateGEP(Builder.getInt8Ty(), Arg0, curIdx);
+    Value* currentChar = Builder.CreateLoad(Builder.getInt8Ty(), charPtr);
+    currentChar = Builder.CreateIntCast(currentChar, Builder.getInt32Ty(), false);
+    
+    BasicBlock* matchBlock = BasicBlock::Create(Context, "charclass_match", MatchF);
+    BasicBlock* nomatchBlock = BasicBlock::Create(Context, "charclass_nomatch", MatchF);
+    
+    Value* finalMatch = nullptr;
+    
+    // For dot (.) class, match any character except newline
+    if (dotClass) {
+        Value* isNewline = Builder.CreateICmpEQ(currentChar, 
+            ConstantInt::get(Context, APInt(32, '\n')));
+        Value* isCarriageReturn = Builder.CreateICmpEQ(currentChar, 
+            ConstantInt::get(Context, APInt(32, '\r')));
+        Value* isLineEnd = Builder.CreateOr(isNewline, isCarriageReturn);
+        finalMatch = Builder.CreateNot(isLineEnd);
+    } else {
+        // For regular character classes, check each range
+        for (const auto& range : ranges) {
+            Value* geStart = Builder.CreateICmpUGE(currentChar, 
+                ConstantInt::get(Context, APInt(32, range.start)));
+            Value* leEnd = Builder.CreateICmpULE(currentChar, 
+                ConstantInt::get(Context, APInt(32, range.end)));
+            Value* rangeMatch = Builder.CreateAnd(geStart, leEnd);
+            
+            if (!range.included) {
+                rangeMatch = Builder.CreateNot(rangeMatch);
+            }
+            
+            if (finalMatch == nullptr) {
+                finalMatch = rangeMatch;
+            } else {
+                finalMatch = Builder.CreateOr(finalMatch, rangeMatch);
+            }
+        }
+        
+        // Apply negation if needed
+        if (negated) {
+            finalMatch = Builder.CreateNot(finalMatch);
+        }
+    }
+    
+    Builder.CreateCondBr(finalMatch, matchBlock, nomatchBlock);
+    
+    Builder.SetInsertPoint(matchBlock);
+    Builder.CreateBr(GetSuccessBlock());
+    
+    Builder.SetInsertPoint(nomatchBlock);
+    Builder.CreateBr(GetFailBlock());
+    
+    return nullptr;
+}
 
 // New JIT compilation interface
 void CompileRegex(const std::string& pattern) {
