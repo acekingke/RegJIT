@@ -139,6 +139,28 @@ class Root {
     Value* CodeGen() override;
     ~CharClass() override = default;
   };
+
+  // Anchor class for ^, $, \b, \B
+  class Anchor: public Root {
+    public:
+    enum AnchorType {
+        Start,          // ^ - line start
+        End,            // $ - line end
+        WordBoundary,   // \b - word boundary
+        NonWordBoundary // \B - non-word boundary
+    };
+    
+    private:
+    AnchorType anchorType;
+    
+    public:
+    explicit Anchor(AnchorType type) : anchorType(type) {}
+    
+    AnchorType getType() const { return anchorType; }
+    
+    Value* CodeGen() override;
+    ~Anchor() override = default;
+  };
 void Initialize();
 void Compile();
 void CompileRegex(const std::string& pattern);

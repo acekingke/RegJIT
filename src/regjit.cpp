@@ -157,10 +157,13 @@ Value* Concat::CodeGen() {
       (*It)->SetSuccessBlock(SuccessBlock);
       (*It)->CodeGen();
       Builder.SetInsertPoint(SuccessBlock);
-      // Increment index
-      Value *CurI = Builder.CreateLoad(Builder.getInt32Ty(), Index);
-      Value *NextI = Builder.CreateAdd(CurI, ConstantInt::get(Context, APInt(32, 1)));
-      Builder.CreateStore(NextI, Index);
+      // Increment index only for non-anchor elements
+      // Anchors are zero-width assertions and don't consume characters
+      if (dynamic_cast<Anchor*>(It->get()) == nullptr) {
+        Value *CurI = Builder.CreateLoad(Builder.getInt32Ty(), Index);
+        Value *NextI = Builder.CreateAdd(CurI, ConstantInt::get(Context, APInt(32, 1)));
+        Builder.CreateStore(NextI, Index);
+      }
     }else {
       (*It)->SetSuccessBlock(GetSuccessBlock());
       (*It)->CodeGen();
@@ -337,6 +340,8 @@ public:
     }
 
     char current() const { return m_cur_char; }
+    
+    bool is_end() const { return m_cur_char == 0; }
 
     enum TokenType {
         CHAR,
@@ -349,8 +354,11 @@ public:
         LBRACKET, // [
         RBRACKET, // ]
         DASH,    // -
-        CARET,   // ^
+        CARET,   // ^ (inside character class)
+        CARET_ANCHOR, // ^ (line start anchor)
+        DOLLAR,  // $ (line end anchor)
         DOT,     // .
+        BACKSLASH, // \ (escape sequence start)
         EOS      // End of string
     };
 
@@ -360,8 +368,8 @@ public:
     };
 
     Token get_next_token() {
-        while (m_cur_char != '\0') {
-            switch (m_cur_char) {
+        while (!is_end()) {
+            switch (current()) {
                 case '*': next(); return {STAR, '*'};
                 case '+': next(); return {PLUS, '+'};
                 case '?': next(); return {QMARK, '?'};
@@ -371,22 +379,27 @@ public:
                 case '[': next(); return {LBRACKET, '['};
                 case ']': next(); return {RBRACKET, ']'};
                 case '-': next(); return {DASH, '-'};
-                case '^': next(); return {CARET, '^'};
+                case '^': next(); return {CARET, '^'}; // Will be handled by parser based on context
+                case '$': next(); return {DOLLAR, '$'};
                 case '.': next(); return {DOT, '.'};
                 case '\\': { // Handle escape characters
                     next();
                     char c = current();
+                    if (is_end()) break;
                     next();
                     return {CHAR, c};
                 }
-                default: {
+                default:
+                    if (isspace(current())) {
+                        next();
+                        continue;
+                    }
                     char c = current();
                     next();
                     return {CHAR, c};
-                }
             }
         }
-        return {EOS, '\0'};
+        return {EOS, 0};
     }
 };
 
@@ -456,10 +469,25 @@ class RegexParser {
             return std::make_unique<CharClass>(false, true); // dot class
         } else if (m_cur_token.type == RegexLexer::LBRACKET) {
             return parse_character_class();
-        } else if (m_cur_token.type == RegexLexer::CHAR) {
-            char c = m_cur_token.value;
+        } else if (m_cur_token.type == RegexLexer::CARET) {
             m_cur_token = m_lexer.get_next_token();
-            return std::make_unique<Match>(c);
+            return std::make_unique<Anchor>(Anchor::Start); // ^ anchor
+        } else if (m_cur_token.type == RegexLexer::DOLLAR) {
+            m_cur_token = m_lexer.get_next_token();
+            return std::make_unique<Anchor>(Anchor::End); // $ anchor
+        } else if (m_cur_token.type == RegexLexer::CHAR) {
+            // Check for escape sequences \b, \B
+            if (m_cur_token.value == 'b') {
+                m_cur_token = m_lexer.get_next_token();
+                return std::make_unique<Anchor>(Anchor::WordBoundary); // \b
+            } else if (m_cur_token.value == 'B') {
+                m_cur_token = m_lexer.get_next_token();
+                return std::make_unique<Anchor>(Anchor::NonWordBoundary); // \B
+            } else {
+                char c = m_cur_token.value;
+                m_cur_token = m_lexer.get_next_token();
+                return std::make_unique<Match>(c);
+            }
         }
         throw std::runtime_error("Unexpected token");
     }
@@ -582,6 +610,194 @@ Value* CharClass::CodeGen() {
     
     Builder.SetInsertPoint(nomatchBlock);
     Builder.CreateBr(GetFailBlock());
+    
+    return nullptr;
+}
+
+// Anchor implementation
+Value* Anchor::CodeGen() {
+    Value* curIdx = Builder.CreateLoad(Builder.getInt32Ty(), Index);
+    Value* match = nullptr;
+    
+    switch (anchorType) {
+        case Start: {
+            // ^ matches at the beginning of the string (index == 0)
+            match = Builder.CreateICmpEQ(curIdx, 
+                ConstantInt::get(Context, APInt(32, 0)));
+            break;
+        }
+        case End: {
+            // $ matches at the end of the string (index == strlen)
+            Value* strLen = Builder.CreateCall(
+                Function::Create(
+                    FunctionType::get(Builder.getInt32Ty(), {Builder.getInt8Ty()->getPointerTo()}, false),
+                    Function::ExternalLinkage,
+                    "strlen",
+                    ThisModule.get()
+                ),
+                {Arg0}
+            );
+            match = Builder.CreateICmpEQ(curIdx, strLen);
+            break;
+        }
+        case WordBoundary: {
+            // \b matches at word boundaries (transition between \w and \W)
+            // Check if current position is at string boundaries
+            Value* strLen = Builder.CreateCall(
+                Function::Create(
+                    FunctionType::get(Builder.getInt32Ty(), {Builder.getInt8Ty()->getPointerTo()}, false),
+                    Function::ExternalLinkage,
+                    "strlen",
+                    ThisModule.get()
+                ),
+                {Arg0}
+            );
+            
+            Value* atStart = Builder.CreateICmpEQ(curIdx, 
+                ConstantInt::get(Context, APInt(32, 0)));
+            Value* atEnd = Builder.CreateICmpEQ(curIdx, strLen);
+            Value* atBoundary = Builder.CreateOr(atStart, atEnd);
+            
+            // If not at boundary, check character transition
+            BasicBlock* checkTransition = BasicBlock::Create(Context, "check_transition", MatchF);
+            BasicBlock* endCheck = BasicBlock::Create(Context, "end_check", MatchF);
+            
+            BasicBlock* currentBlock = Builder.GetInsertBlock();
+            Builder.CreateCondBr(atBoundary, endCheck, checkTransition);
+            
+            // Check character transition
+            Builder.SetInsertPoint(checkTransition);
+            
+            // Get current character
+            Value* curCharPtr = Builder.CreateGEP(Builder.getInt8Ty(), Arg0, curIdx);
+            Value* curChar = Builder.CreateLoad(Builder.getInt8Ty(), curCharPtr);
+            curChar = Builder.CreateIntCast(curChar, Builder.getInt32Ty(), false);
+            
+            // Get previous character
+            Value* prevIdx = Builder.CreateSub(curIdx, ConstantInt::get(Context, APInt(32, 1)));
+            Value* prevCharPtr = Builder.CreateGEP(Builder.getInt8Ty(), Arg0, prevIdx);
+            Value* prevChar = Builder.CreateLoad(Builder.getInt8Ty(), prevCharPtr);
+            prevChar = Builder.CreateIntCast(prevChar, Builder.getInt32Ty(), false);
+            
+            // Check if characters are word characters (\w = [a-zA-Z0-9_])
+            auto isWordChar = [&](Value* ch) -> Value* {
+                Value* isLower = Builder.CreateAnd(
+                    Builder.CreateICmpUGE(ch, ConstantInt::get(Context, APInt(32, 'a'))),
+                    Builder.CreateICmpULE(ch, ConstantInt::get(Context, APInt(32, 'z')))
+                );
+                Value* isUpper = Builder.CreateAnd(
+                    Builder.CreateICmpUGE(ch, ConstantInt::get(Context, APInt(32, 'A'))),
+                    Builder.CreateICmpULE(ch, ConstantInt::get(Context, APInt(32, 'Z')))
+                );
+                Value* isDigit = Builder.CreateAnd(
+                    Builder.CreateICmpUGE(ch, ConstantInt::get(Context, APInt(32, '0'))),
+                    Builder.CreateICmpULE(ch, ConstantInt::get(Context, APInt(32, '9')))
+                );
+                Value* isUnderscore = Builder.CreateICmpEQ(ch, 
+                    ConstantInt::get(Context, APInt(32, '_')));
+                
+                return Builder.CreateOr(Builder.CreateOr(Builder.CreateOr(isLower, isUpper), isDigit), isUnderscore);
+            };
+            
+            Value* curIsWord = isWordChar(curChar);
+            Value* prevIsWord = isWordChar(prevChar);
+            
+            // Word boundary: one is word char, the other is not
+            Value* isBoundary = Builder.CreateXor(curIsWord, prevIsWord);
+            
+            Builder.CreateBr(endCheck);
+            
+// Combine results
+            Builder.SetInsertPoint(endCheck);
+            PHINode* result = Builder.CreatePHI(Builder.getInt1Ty(), 2);
+            result->addIncoming(ConstantInt::get(Context, APInt(1, 1)), currentBlock);
+            result->addIncoming(isBoundary, checkTransition);
+            
+            match = result;
+            break;
+        }
+        case NonWordBoundary: {
+            // \B matches at non-word boundaries
+            // This is the negation of \b
+            // For simplicity, we'll implement this as a separate check
+            Value* strLen = Builder.CreateCall(
+                Function::Create(
+                    FunctionType::get(Builder.getInt32Ty(), {Builder.getInt8Ty()->getPointerTo()}, false),
+                    Function::ExternalLinkage,
+                    "strlen",
+                    ThisModule.get()
+                ),
+                {Arg0}
+            );
+            
+            Value* atStart = Builder.CreateICmpEQ(curIdx, 
+                ConstantInt::get(Context, APInt(32, 0)));
+            Value* atEnd = Builder.CreateICmpEQ(curIdx, strLen);
+            Value* atBoundary = Builder.CreateOr(atStart, atEnd);
+            
+            // If at boundary, this is not a non-word boundary
+            BasicBlock* checkTransition = BasicBlock::Create(Context, "check_nonword_transition", MatchF);
+            BasicBlock* endCheck = BasicBlock::Create(Context, "end_nonword_check", MatchF);
+            
+            Builder.CreateCondBr(atBoundary, endCheck, checkTransition);
+            
+            // Check character transition (same as \b but negated)
+            Builder.SetInsertPoint(checkTransition);
+            
+            // Get current character
+            Value* curCharPtr = Builder.CreateGEP(Builder.getInt8Ty(), Arg0, curIdx);
+            Value* curChar = Builder.CreateLoad(Builder.getInt8Ty(), curCharPtr);
+            curChar = Builder.CreateIntCast(curChar, Builder.getInt32Ty(), false);
+            
+            // Get previous character
+            Value* prevIdx = Builder.CreateSub(curIdx, ConstantInt::get(Context, APInt(32, 1)));
+            Value* prevCharPtr = Builder.CreateGEP(Builder.getInt8Ty(), Arg0, prevIdx);
+            Value* prevChar = Builder.CreateLoad(Builder.getInt8Ty(), prevCharPtr);
+            prevChar = Builder.CreateIntCast(prevChar, Builder.getInt32Ty(), false);
+            
+            // Check if characters are word characters
+            auto isWordChar = [&](Value* ch) -> Value* {
+                Value* isLower = Builder.CreateAnd(
+                    Builder.CreateICmpUGE(ch, ConstantInt::get(Context, APInt(32, 'a'))),
+                    Builder.CreateICmpULE(ch, ConstantInt::get(Context, APInt(32, 'z')))
+                );
+                Value* isUpper = Builder.CreateAnd(
+                    Builder.CreateICmpUGE(ch, ConstantInt::get(Context, APInt(32, 'A'))),
+                    Builder.CreateICmpULE(ch, ConstantInt::get(Context, APInt(32, 'Z')))
+                );
+                Value* isDigit = Builder.CreateAnd(
+                    Builder.CreateICmpUGE(ch, ConstantInt::get(Context, APInt(32, '0'))),
+                    Builder.CreateICmpULE(ch, ConstantInt::get(Context, APInt(32, '9')))
+                );
+                Value* isUnderscore = Builder.CreateICmpEQ(ch, 
+                    ConstantInt::get(Context, APInt(32, '_')));
+                
+                return Builder.CreateOr(Builder.CreateOr(Builder.CreateOr(isLower, isUpper), isDigit), isUnderscore);
+            };
+            
+            Value* curIsWord = isWordChar(curChar);
+            Value* prevIsWord = isWordChar(prevChar);
+            
+            // Non-word boundary: both are word chars or both are non-word chars
+            Value* bothWord = Builder.CreateAnd(curIsWord, prevIsWord);
+            Value* bothNonWord = Builder.CreateAnd(Builder.CreateNot(curIsWord), Builder.CreateNot(prevIsWord));
+            Value* isNonBoundary = Builder.CreateOr(bothWord, bothNonWord);
+            
+            Builder.CreateBr(endCheck);
+            
+            // Combine results
+            Builder.SetInsertPoint(endCheck);
+            PHINode* result = Builder.CreatePHI(Builder.getInt1Ty(), 2);
+            result->addIncoming(ConstantInt::get(Context, APInt(1, 0)), atBoundary ? Builder.GetInsertBlock() : Builder.GetInsertBlock());
+            result->addIncoming(isNonBoundary, checkTransition);
+            
+            match = result;
+            break;
+        }
+    }
+    
+    // Use the same pattern as Match::CodeGen - connect to fail/success blocks
+    Builder.CreateCondBr(match, GetSuccessBlock(), GetFailBlock());
     
     return nullptr;
 }

@@ -1,0 +1,33 @@
+# Compiled files
+*.o
+*.dSYM/
+*.dylib
+
+# Test executables
+test_*
+debug*
+final_test
+simple_test
+sample
+bench
+
+# Debug and profiling files
+.DS_Store
+.vscode/
+*.dSYM/
+
+# Build artifacts
+run.txt
+
+# IDE files
+.vscode/
+*.swp
+*.swo
+*~
+
+# Documentation (keep as reference, not tracked in main repo)
+Agents.md
+test_*.*
+debug_*.*
+final_test.*
+simple_*.*
