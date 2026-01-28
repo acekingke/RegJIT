@@ -34,9 +34,11 @@ using namespace llvm::orc;
 class Root {
     BasicBlock* failBlock;
     BasicBlock* nextBlock;
-    public:
+public:
     virtual ~Root() = default;
     virtual Value *CodeGen() = 0;
+    // Returns true if this node is zero-width (e.g. anchor, lookaround, etc)
+    virtual bool isZeroWidth() const { return false; }
     void SetFailBlock(BasicBlock *b) {
       failBlock = b;
     }
@@ -94,16 +96,31 @@ class Root {
   // Repeat
   class Repeat: public Root{
     public:
-    enum TimeType{
-      Star = 0,
-      Plus = -1
-    };
     std::unique_ptr<Root> Body;
-    int times;
-    explicit Repeat(std::unique_ptr<Root> b, int t):Body(std::move(b)), times(t){}
+    int minCount;
+    int maxCount;
+    bool nonGreedy;
+    // 通用构造函数——支持所有量词
+    Repeat(std::unique_ptr<Root> b, int min, int max, bool nongreedy = false)
+      : Body(std::move(b)), minCount(min), maxCount(max), nonGreedy(nongreedy){}
+
+    // 兼容旧的 * 与 + 构造方式
+    static std::unique_ptr<Repeat> makeStar(std::unique_ptr<Root> b, bool nongreedy=false) {
+      return std::make_unique<Repeat>(std::move(b), 0, -1, nongreedy);
+    }
+    static std::unique_ptr<Repeat> makePlus(std::unique_ptr<Root> b, bool nongreedy=false) {
+      return std::make_unique<Repeat>(std::move(b), 1, -1, nongreedy);
+    }
+    static std::unique_ptr<Repeat> makeExact(std::unique_ptr<Root> b, int n, bool nongreedy=false) {
+      return std::make_unique<Repeat>(std::move(b), n, n, nongreedy);
+    }
+    static std::unique_ptr<Repeat> makeRange(std::unique_ptr<Root> b, int min, int max, bool nongreedy=false) {
+      return std::make_unique<Repeat>(std::move(b), min, max, nongreedy);
+    }
     Value* CodeGen() override;
     ~Repeat() override = default;
   };
+
 
   // Character class
   class CharClass: public Root {
@@ -142,25 +159,22 @@ class Root {
 
   // Anchor class for ^, $, \b, \B
   class Anchor: public Root {
-    public:
+public:
     enum AnchorType {
         Start,          // ^ - line start
         End,            // $ - line end
         WordBoundary,   // \b - word boundary
         NonWordBoundary // \B - non-word boundary
     };
-    
-    private:
+private:
     AnchorType anchorType;
-    
-    public:
+public:
     explicit Anchor(AnchorType type) : anchorType(type) {}
-    
     AnchorType getType() const { return anchorType; }
-    
     Value* CodeGen() override;
+    bool isZeroWidth() const override { return true; }
     ~Anchor() override = default;
-  };
+};
 void Initialize();
 void Compile();
 void CompileRegex(const std::string& pattern);

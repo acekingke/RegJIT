@@ -1,5 +1,5 @@
 DEBUG_FLAGS := -g -O0
-LLVM_CONFIG := /opt/homebrew/opt/llvm/bin/llvm-config
+LLVM_CONFIG := /opt/homebrew/Cellar/llvm/19.1.7_1/bin/llvm-config
 CXXFLAGS := $(DEBUG_FLAGS) -Wall -Wno-unknown-warning-option -std=c++17
 CXXFLAGS += $(shell $(LLVM_CONFIG) --cxxflags)
 
@@ -19,6 +19,8 @@ test: $(OBJ)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
 # Test specific functionality in tests/
+test_anchor_quant_edge: tests/test_anchor_quant_edge.cpp $(REGJIT_OBJ)
+	$(CXX) $(CXXFLAGS) -I./src -o $@ $^ $(LDFLAGS) $(LDLIBS)
 test_charclass: tests/test_charclass.cpp $(REGJIT_OBJ)
 	$(CXX) $(CXXFLAGS) -I./src -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
@@ -53,6 +55,18 @@ final_test: final_test.cpp $(REGJIT_OBJ)
 	$(CXX) $(CXXFLAGS) -I./src -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
 simple_test: simple_test.cpp $(REGJIT_OBJ)
+	$(CXX) $(CXXFLAGS) -I./src -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+debug_dollar: debug_dollar.cpp $(REGJIT_OBJ)
+	$(CXX) $(CXXFLAGS) -I./src -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+debug_engine: debug_engine.cpp $(REGJIT_OBJ)
+	$(CXX) $(CXXFLAGS) -I./src -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+test_single: test_single.cpp $(REGJIT_OBJ)
+	$(CXX) $(CXXFLAGS) -I./src -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+test_basic_multi: test_basic_multi.cpp $(REGJIT_OBJ)
 	$(CXX) $(CXXFLAGS) -I./src -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
 # Run all tests in tests directory

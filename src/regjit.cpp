@@ -86,53 +86,88 @@ int Execute(const char* input) {
   return ResultCode;
 }
 
+//
+// Anchor/Quantifier Search Mode Note:
+// PCRE, std::regex, and RE2 all require that anchors (e.g. ^, $, \b) with quantifiers (e.g. ^*, $+) are matched by attempting the regex at every possible offset in the input string.
+// This search loop (and the logic below) is essential for correct zero-width anchor + quantifier compatibility. DO NOT REMOVE/REFRACTOR this loop unless you re-run all anchor/quant edge tests against PCRE/RE2.
+//
 Value* Func::CodeGen() {
-  FunctionType *matchFuncType = FunctionType::get(
+    FunctionType *matchFuncType = FunctionType::get(
         Builder.getInt32Ty(), 
         {PointerType::get(Builder.getInt8Ty(), 0)},
         false
     );
-     MatchF = Function::Create(
+    MatchF = Function::Create(
         matchFuncType, Function::ExternalLinkage, FunctionName, ThisModule.get());
 
     Arg0 = MatchF->arg_begin();
     Arg0->setName(FunArgName);
 
+    // Create entry block and index variable
     BasicBlock *EntryBB = BasicBlock::Create(Context, "entry", MatchF);
     Builder.SetInsertPoint(EntryBB);
     Index = Builder.CreateAlloca(Builder.getInt32Ty());
     Builder.CreateStore(ConstantInt::get(Context, APInt(32, 0)), Index);
-    BasicBlock *TrueBlock = BasicBlock::Create(Context, TrueBlockName, MatchF);
-  BasicBlock *FalseBlock = BasicBlock::Create(Context, FalseBlockName, MatchF);
-  Body->SetFailBlock(FalseBlock);
-  Body->SetSuccessBlock(TrueBlock);
-  Body->CodeGen(); 
-  
-  // Add end-of-string check
-  Builder.SetInsertPoint(TrueBlock);
-  // Load current index
-  Value *CurIdx = Builder.CreateLoad(Builder.getInt32Ty(), Index);
-  // CurIdx++
-  Value *NextIdx = Builder.CreateAdd(CurIdx, ConstantInt::get(Context, APInt(32, 1)));
-  // Get string length using strlen
-  Value *StrLen = Builder.CreateCall(
-      ThisModule->getOrInsertFunction("strlen", 
-          FunctionType::get(Builder.getInt32Ty(), {PointerType::get(Builder.getInt8Ty(), 0)}, false)),
-      {Arg0});
-  // Compare index with string length
-  Value *AtEnd = Builder.CreateICmpEQ(NextIdx, StrLen);
-  BasicBlock *RealTrueBlock = BasicBlock::Create(Context, "real_true", MatchF);
-  Builder.CreateCondBr(AtEnd, RealTrueBlock, FalseBlock);
-  
-  // Update final return blocks
- 
-  Builder.SetInsertPoint(RealTrueBlock);
-  Builder.CreateRet(ConstantInt::get(Context, APInt(32, 1)));
-  Builder.SetInsertPoint(FalseBlock);
-  Builder.CreateRet(ConstantInt::get(Context, APInt(32, 0)));
-  
-
-  return nullptr;
+    
+    // Compute string length (needed for search)
+    Function *StrlenF = Function::Create(
+        FunctionType::get(Builder.getInt32Ty(), {Builder.getInt8Ty()->getPointerTo()}, false),
+        Function::ExternalLinkage,
+        "strlen",
+        ThisModule.get()
+    );
+    Value *strlenVal = Builder.CreateCall(StrlenF, {Arg0});
+    
+    // Create search loop basic blocks
+    BasicBlock *LoopCheckBB = BasicBlock::Create(Context, "search_loop_check", MatchF);
+    BasicBlock *LoopBodyBB = BasicBlock::Create(Context, "search_loop_body", MatchF);
+    BasicBlock *LoopIncBB = BasicBlock::Create(Context, "search_loop_inc", MatchF);
+    BasicBlock *ReturnFailBB = BasicBlock::Create(Context, "return_fail", MatchF);
+    BasicBlock *ReturnSuccessBB = BasicBlock::Create(Context, "return_success", MatchF);
+    
+    // Start loop
+    Builder.CreateBr(LoopCheckBB);
+    
+    // Search loop condition: for(curIdx=0; curIdx<=strlen; ++curIdx)
+    Builder.SetInsertPoint(LoopCheckBB);
+    Value *curIdx = Builder.CreateLoad(Builder.getInt32Ty(), Index);
+    Value *cond = Builder.CreateICmpSLE(curIdx, strlenVal);
+    Builder.CreateCondBr(cond, LoopBodyBB, ReturnFailBB);
+    
+    // Search loop body: try match at current curIdx
+    Builder.SetInsertPoint(LoopBodyBB);
+    // Set index value for match
+    // (already set unless coming from inc, but safe to repeat)
+    Builder.CreateStore(curIdx, Index);
+    
+    // Each search attempt gets its own AST success/fail blocks
+    BasicBlock *TrySuccess = BasicBlock::Create(Context, "try_success", MatchF);
+    BasicBlock *TryFail = BasicBlock::Create(Context, "try_fail", MatchF);
+    Body->SetFailBlock(TryFail);
+    Body->SetSuccessBlock(TrySuccess);
+    Body->CodeGen();
+    
+    // On success: return 1
+    Builder.SetInsertPoint(TrySuccess);
+    Builder.CreateBr(ReturnSuccessBB);
+    // On fail: increment and continue
+    Builder.SetInsertPoint(TryFail);
+    Builder.CreateBr(LoopIncBB);
+    
+    // Loop increment
+    Builder.SetInsertPoint(LoopIncBB);
+    Value *idxAfter = Builder.CreateAdd(curIdx, ConstantInt::get(Context, APInt(32, 1)));
+    Builder.CreateStore(idxAfter, Index);
+    Builder.CreateBr(LoopCheckBB);
+    
+    // Return success and fail blocks
+    Builder.SetInsertPoint(ReturnSuccessBB);
+    Builder.CreateRet(ConstantInt::get(Context, APInt(32, 1)));
+    Builder.SetInsertPoint(ReturnFailBB);
+    Builder.CreateRet(ConstantInt::get(Context, APInt(32, 0)));
+    
+    // Done
+    return nullptr;
 }
 Value* Match::CodeGen() {
     // Load current index
@@ -147,37 +182,40 @@ Value* Match::CodeGen() {
     return nullptr;
 }
 Value* Concat::CodeGen() {
-  auto  It = BodyVec.begin();
-  while (It != BodyVec.end()) {
-    auto NextIt = It+1;
-    BasicBlock* SuccessBlock;
-    (*It)->SetFailBlock(GetFailBlock());
-    if (NextIt != BodyVec.end()) {
-      SuccessBlock =  BasicBlock::Create(Context, "next", MatchF);
-      (*It)->SetSuccessBlock(SuccessBlock);
-      (*It)->CodeGen();
-      Builder.SetInsertPoint(SuccessBlock);
-      // Increment index only for non-anchor elements
-      // Anchors are zero-width assertions and don't consume characters
-      if (dynamic_cast<Anchor*>(It->get()) == nullptr) {
-        Value *CurI = Builder.CreateLoad(Builder.getInt32Ty(), Index);
-        Value *NextI = Builder.CreateAdd(CurI, ConstantInt::get(Context, APInt(32, 1)));
-        Builder.CreateStore(NextI, Index);
-      }
-    }else {
-      (*It)->SetSuccessBlock(GetSuccessBlock());
-      (*It)->CodeGen();
-
-      // After the last element, if it consumes characters, increment index
-      // This ensures that after matching the full pattern, index points to the end
-      if (dynamic_cast<Anchor*>(It->get()) == nullptr) {
-        // Get current index after the last element
-        Value *CurI = Builder.CreateLoad(Builder.getInt32Ty(), Index);
-        Value *NextI = Builder.CreateAdd(CurI, ConstantInt::get(Context, APInt(32, 1)));
-        Builder.CreateStore(NextI, Index);
-      }
+  if (BodyVec.empty()) return nullptr;
+  
+  // Pre-create transition blocks for each element (except last)
+  std::vector<BasicBlock*> transitionBlocks;
+  for (size_t i = 0; i < BodyVec.size() - 1; i++) {
+    transitionBlocks.push_back(
+      BasicBlock::Create(Context, "next", MatchF)
+    );
+  }
+  
+  // Set up first element
+  BodyVec[0]->SetFailBlock(GetFailBlock());
+  BodyVec[0]->SetSuccessBlock(
+    BodyVec.size() > 1 ? transitionBlocks[0] : GetSuccessBlock()
+  );
+  BodyVec[0]->CodeGen();
+  
+  // Process middle elements with proper block chaining
+  for (size_t i = 1; i < BodyVec.size(); i++) {
+    Builder.SetInsertPoint(transitionBlocks[i-1]);
+    
+    // Increment index (except for anchors)
+    if (dynamic_cast<Anchor*>(BodyVec[i-1].get()) == nullptr) {
+      Value* CurI = Builder.CreateLoad(Builder.getInt32Ty(), Index);
+      Value* NextI = Builder.CreateAdd(CurI, ConstantInt::get(Context, APInt(32, 1)));
+      Builder.CreateStore(NextI, Index);
     }
-    It++;
+    
+    // Set up current element
+    BodyVec[i]->SetFailBlock(GetFailBlock());
+    BodyVec[i]->SetSuccessBlock(
+      i < transitionBlocks.size() ? transitionBlocks[i] : GetSuccessBlock()
+    );
+    BodyVec[i]->CodeGen();
   }
   
   return nullptr;
@@ -219,119 +257,121 @@ Value* Not::CodeGen(){
   return nullptr;
 }
 
+// --- PATCH: Handle quantifiers of zero-width (anchor-like) nodes ---
 Value* Repeat::CodeGen() {
-    BasicBlock* origBlock = Builder.GetInsertBlock();
-    
-    if(times == Star) { // 0 or more times
-        BasicBlock* loopBlock = BasicBlock::Create(Context, "repeat_loop", MatchF);
-        BasicBlock* bodySuccess = BasicBlock::Create(Context, "repeat_success", MatchF);
-        BasicBlock* exitBlock = BasicBlock::Create(Context, "repeat_exit", MatchF);
-
-        Builder.CreateBr(loopBlock);
-        
-        // Loop block
-        Builder.SetInsertPoint(loopBlock);
-        Body->SetSuccessBlock(bodySuccess);
-        Body->SetFailBlock(exitBlock);
+    // Detect anchor/zero-width nodes robustly (covers Anchor, lookaround, future types)
+    bool bodyIsZeroWidth = Body->isZeroWidth();
+    // If zero-width, only allow a single match (at most), per regex engine semantics.
+    if (bodyIsZeroWidth) {
+        /*
+         * Zero-width quantifier logic (reference: PCRE, RE2, std::regex):
+         * - {0,} ('*', zero or more): always matches (valid to match zero times at zero-width position)
+         * - {1}: match only once at this position
+         * - {>1}: cannot match (no position allows >1 consecutive zero-width match)
+         * This covers all anchors, zero-width lookaround, etc.
+         */
+        if (minCount > 1) {
+            // Impossible to match anchor more than once per position: instantly fail
+            Builder.CreateBr(GetFailBlock());
+            return nullptr;
+        }
+        // Accept if 0 is allowed (e.g. * quantifier or {0,1})
+        if (minCount == 0) {
+            Builder.CreateBr(GetSuccessBlock());
+            return nullptr;
+        }
+        // min==1; Only one iteration is possible; match if anchor matches, else fail
+        BasicBlock* bodyBlock = BasicBlock::Create(Context, "repeat_zero_width_one", MatchF);
+        BasicBlock* finalBlock = BasicBlock::Create(Context, "repeat_zero_width_exit", MatchF);
+        Builder.CreateBr(bodyBlock);
+        Builder.SetInsertPoint(bodyBlock);
+        Body->SetSuccessBlock(finalBlock);
+        Body->SetFailBlock(GetFailBlock());
         Body->CodeGen();
-
-        // Body success - increment index and loop
-        Builder.SetInsertPoint(bodySuccess);
-        Value* curIdx = Builder.CreateLoad(Builder.getInt32Ty(), Index);
-        Value* newIdx = Builder.CreateAdd(curIdx, ConstantInt::get(Context, APInt(32, 1)));
-        Builder.CreateStore(newIdx, Index);
-        Builder.CreateBr(loopBlock);
-        
-        // Exit block - continue to success
-        Builder.SetInsertPoint(exitBlock);
-        // Rollback index on failure
-        curIdx = Builder.CreateLoad(Builder.getInt32Ty(), Index);
-        newIdx = Builder.CreateSub(curIdx, ConstantInt::get(Context, APInt(32, 1)));
-        Builder.CreateStore(newIdx, Index);
+        Builder.SetInsertPoint(finalBlock);
         Builder.CreateBr(GetSuccessBlock());
+        return nullptr;
     }
-    else if(times == Plus) { // 1 or more times
-        BasicBlock* firstCheck = BasicBlock::Create(Context, "repeat_first", MatchF);
-        BasicBlock* loopBlock = BasicBlock::Create(Context, "repeat_loop", MatchF);
-        BasicBlock* bodySuccess = BasicBlock::Create(Context, "repeat_success", MatchF);
-        BasicBlock* exitBlock = BasicBlock::Create(Context, "repeat_exit", MatchF);
-
-        Builder.CreateBr(firstCheck);
-        
-        // First mandatory check
-        Builder.SetInsertPoint(firstCheck);
-        Body->SetSuccessBlock(bodySuccess);
-        Body->SetFailBlock(GetFailBlock()); // Fail if first match fails
-        Body->CodeGen();
-
-        // First success - increment index and enter loop
-        Builder.SetInsertPoint(bodySuccess);
-        Value* curIdx = Builder.CreateLoad(Builder.getInt32Ty(), Index);
-        Value* newIdx = Builder.CreateAdd(curIdx, ConstantInt::get(Context, APInt(32, 1)));
-        Builder.CreateStore(newIdx, Index);
-        Builder.CreateBr(loopBlock);
-
-        // Loop block for additional matches
-        Builder.SetInsertPoint(loopBlock);
-        Body->SetSuccessBlock(bodySuccess); // Continue looping on success
-        Body->SetFailBlock(exitBlock);       // Exit on failure
-        Body->CodeGen();
-
-        // Exit block
-        Builder.SetInsertPoint(exitBlock);
-        // Rollback index on failure
-        curIdx = Builder.CreateLoad(Builder.getInt32Ty(), Index);
-        newIdx = Builder.CreateSub(curIdx, ConstantInt::get(Context, APInt(32, 1)));
-        Builder.CreateStore(newIdx, Index);
-        Builder.CreateBr(GetSuccessBlock());
-    }
-    else if(times > 0) { // Exact count
-        Value* counter = Builder.CreateAlloca(Builder.getInt32Ty());
+    // 通用支持 minCount/maxCount/nonGreedy 的量词
+    BasicBlock* entry = Builder.GetInsertBlock();
+    auto intTy = Builder.getInt32Ty();
+    // 精确重复，直接循环min次
+    if (minCount == maxCount && minCount > 0) {
+        Value* counter = Builder.CreateAlloca(intTy);
         Builder.CreateStore(ConstantInt::get(Context, APInt(32, 0)), counter);
-        Value* count = Builder.CreateLoad(Builder.getInt32Ty(), counter);
-        Value* InitVal = Builder.CreateLoad(Builder.getInt32Ty(), Index);
-        BasicBlock* checkBlock = BasicBlock::Create(Context, "repeat_check", MatchF);
-        BasicBlock* loopBlock = BasicBlock::Create(Context, "repeat_loop", MatchF);
-        BasicBlock* bodySuccess = BasicBlock::Create(Context, "repeat_success", MatchF);
-        BasicBlock* exitBlock = BasicBlock::Create(Context, "repeat_exit", MatchF);
-
+        BasicBlock* checkBlock = BasicBlock::Create(Context, "repeat_check_exact", MatchF);
+        BasicBlock* bodyBlock = BasicBlock::Create(Context, "repeat_body_exact", MatchF);
+        BasicBlock* exitBlock = BasicBlock::Create(Context, "repeat_exit_exact", MatchF);
         Builder.CreateBr(checkBlock);
-        
-        // Check iteration count
+        // count check
         Builder.SetInsertPoint(checkBlock);
-        PHINode *countPhi = Builder.CreatePHI(Type::getInt32Ty(Context), 2, "phi_node2");
-        countPhi->addIncoming(count, origBlock);
-        Value* cond = Builder.CreateICmpSLT(countPhi, 
-            ConstantInt::get(Context, APInt(32, times)));
-        Builder.CreateCondBr(cond, loopBlock, exitBlock);
-   
-
-        // Loop block
-        Builder.SetInsertPoint(loopBlock);
-        Body->SetSuccessBlock(bodySuccess);
-        Body->SetFailBlock(GetFailBlock()); // Fail if any iteration fails
+        Value* cur = Builder.CreateLoad(intTy, counter);
+        Value* cond = Builder.CreateICmpSLT(cur, ConstantInt::get(Context, APInt(32, minCount)));
+        Builder.CreateCondBr(cond, bodyBlock, exitBlock);
+        // repeat body
+        Builder.SetInsertPoint(bodyBlock);
+        Body->SetSuccessBlock(checkBlock);
+        Body->SetFailBlock(GetFailBlock());
         Body->CodeGen();
-
-        // Body success - increment both counters
-        Builder.SetInsertPoint(bodySuccess);
-        Value* curIdx = Builder.CreateLoad(Builder.getInt32Ty(), Index);
-        Value* newIdx = Builder.CreateAdd(curIdx, ConstantInt::get(Context, APInt(32, 1)));
-        Builder.CreateStore(newIdx, Index);
-        
-        Value* newCount = Builder.CreateAdd(countPhi, ConstantInt::get(Context, APInt(32, 1)));
-        countPhi->addIncoming(newCount, bodySuccess);
-        //Builder.CreateStore(newCount, counter);
+        Value* after = Builder.CreateAdd(cur, ConstantInt::get(Context, APInt(32, 1)));
+        Builder.CreateStore(after, counter);
         Builder.CreateBr(checkBlock);
-
-        // Exit block
+        // exit
         Builder.SetInsertPoint(exitBlock);
-        // Rollback index on failure
-        curIdx = Builder.CreateLoad(Builder.getInt32Ty(), Index);
-        newIdx = Builder.CreateSub(curIdx, ConstantInt::get(Context, APInt(32, 1)));
-        Builder.CreateStore(newIdx, Index);
+        Builder.CreateBr(GetSuccessBlock());
+        return nullptr;
+    }
+    // 允许范围（如 {2,5} 或 {3,} ）
+    int minR = minCount < 0 ? 0 : minCount;
+    int maxR = maxCount;
+    // max = -1 视为无穷(贪婪型)
+    Value* counter = Builder.CreateAlloca(intTy);
+    Builder.CreateStore(ConstantInt::get(Context, APInt(32, 0)), counter);
+    BasicBlock* checkMin = BasicBlock::Create(Context, "repeat_min_chk", MatchF);
+    BasicBlock* incMin = BasicBlock::Create(Context, "repeat_min", MatchF);
+    BasicBlock* checkMax = BasicBlock::Create(Context, "repeat_max_chk", MatchF);
+    BasicBlock* incMax = BasicBlock::Create(Context, "repeat_max", MatchF);
+    BasicBlock* exit = BasicBlock::Create(Context, "repeat_exit_rng", MatchF);
+    // 首先循环min次
+    Builder.CreateBr(checkMin);
+    // check min loop
+    Builder.SetInsertPoint(checkMin);
+    Value* val = Builder.CreateLoad(intTy, counter);
+    Value* mincheck = Builder.CreateICmpSLT(val, ConstantInt::get(Context, APInt(32, minR)));
+    Builder.CreateCondBr(mincheck, incMin, checkMax);
+    // min loop体
+    Builder.SetInsertPoint(incMin);
+    Body->SetSuccessBlock(checkMin);
+    Body->SetFailBlock(GetFailBlock());
+    Body->CodeGen();
+    Value* stepmin = Builder.CreateAdd(val, ConstantInt::get(Context, APInt(32,1)));
+    Builder.CreateStore(stepmin, counter);
+    Builder.CreateBr(checkMin);
+    // min循环完后可进入max部分
+    Builder.SetInsertPoint(checkMax);
+    Value* val2 = Builder.CreateLoad(intTy, counter);
+    Value* finished = maxR == -1 ? Builder.getFalse() : Builder.CreateICmpSGE(val2, ConstantInt::get(Context, APInt(32, maxR)));
+    Builder.CreateCondBr(finished, exit, incMax);
+    // max阶段：贪婪与非贪婪切分分支
+    Builder.SetInsertPoint(incMax);
+    if (nonGreedy) {
+        // 非贪婪：尝试余下整体优先
+        Builder.CreateBr(GetSuccessBlock());
+        // 尝试更多匹配
+        Body->SetSuccessBlock(checkMax);
+        Body->SetFailBlock(exit);
+        Body->CodeGen();
+    } else {
+        // 贪婪：优先消耗自身
+        Body->SetSuccessBlock(checkMax);
+        Body->SetFailBlock(exit);
+        Body->CodeGen();
+        // fail时才尝试整体success
         Builder.CreateBr(GetSuccessBlock());
     }
-    
+    // 量词退出
+    Builder.SetInsertPoint(exit);
+    Builder.CreateBr(GetSuccessBlock());
     return nullptr;
 }
 
@@ -362,12 +402,17 @@ public:
         RPAREN, // )
         LBRACKET, // [
         RBRACKET, // ]
+        LBRACE,   // {
+        RBRACE,   // }
+        COMMA,    // ,
         DASH,    // -
         CARET,   // ^ (inside character class)
         CARET_ANCHOR, // ^ (line start anchor)
         DOLLAR,  // $ (line end anchor)
         DOT,     // .
-        BACKSLASH, // \ (escape sequence start)
+        BACKSLASH, // \\ (escape sequence start)
+        WORD_BOUNDARY,    // \\b
+        NON_WORD_BOUNDARY, // \\B
         EOS      // End of string
     };
 
@@ -387,6 +432,9 @@ public:
                 case ')': next(); return {RPAREN, ')'};
                 case '[': next(); return {LBRACKET, '['};
                 case ']': next(); return {RBRACKET, ']'};
+                case '{': next(); return {LBRACE, '{'};
+                case '}': next(); return {RBRACE, '}'};
+                case ',': next(); return {COMMA, ','};
                 case '-': next(); return {DASH, '-'};
                 case '^': next(); return {CARET, '^'}; // Will be handled by parser based on context
                 case '$': next(); return {DOLLAR, '$'};
@@ -396,6 +444,9 @@ public:
                     char c = current();
                     if (is_end()) break;
                     next();
+                    // Return special tokens for \b and \B
+                    if (c == 'b') return {WORD_BOUNDARY, 'b'};
+                    if (c == 'B') return {NON_WORD_BOUNDARY, 'B'};
                     return {CHAR, c};
                 }
                 default:
@@ -484,19 +535,16 @@ class RegexParser {
         } else if (m_cur_token.type == RegexLexer::DOLLAR) {
             m_cur_token = m_lexer.get_next_token();
             return std::make_unique<Anchor>(Anchor::End); // $ anchor
+        } else if (m_cur_token.type == RegexLexer::WORD_BOUNDARY) {
+            m_cur_token = m_lexer.get_next_token();
+            return std::make_unique<Anchor>(Anchor::WordBoundary); // \b
+        } else if (m_cur_token.type == RegexLexer::NON_WORD_BOUNDARY) {
+            m_cur_token = m_lexer.get_next_token();
+            return std::make_unique<Anchor>(Anchor::NonWordBoundary); // \B
         } else if (m_cur_token.type == RegexLexer::CHAR) {
-            // Check for escape sequences \b, \B
-            if (m_cur_token.value == 'b') {
-                m_cur_token = m_lexer.get_next_token();
-                return std::make_unique<Anchor>(Anchor::WordBoundary); // \b
-            } else if (m_cur_token.value == 'B') {
-                m_cur_token = m_lexer.get_next_token();
-                return std::make_unique<Anchor>(Anchor::NonWordBoundary); // \B
-            } else {
-                char c = m_cur_token.value;
-                m_cur_token = m_lexer.get_next_token();
-                return std::make_unique<Match>(c);
-            }
+            char c = m_cur_token.value;
+            m_cur_token = m_lexer.get_next_token();
+            return std::make_unique<Match>(c);
         }
         throw std::runtime_error("Unexpected token");
     }
@@ -507,21 +555,78 @@ class RegexParser {
             switch (m_cur_token.type) {
                 case RegexLexer::STAR: {
                     m_cur_token = m_lexer.get_next_token();
-                    node = std::make_unique<Repeat>(std::move(node), Repeat::Star);
+                    // 看后缀?判断贪婪/非贪婪
+                    bool nongreedy = false;
+                    if (m_cur_token.type == RegexLexer::QMARK) {
+                        nongreedy = true;
+                        m_cur_token = m_lexer.get_next_token();
+                    }
+                    node = Repeat::makeStar(std::move(node), nongreedy);
                     break;
                 }
                 case RegexLexer::PLUS: {
                     m_cur_token = m_lexer.get_next_token();
-                    node = std::make_unique<Repeat>(std::move(node), Repeat::Plus);
+                    bool nongreedy = false;
+                    if (m_cur_token.type == RegexLexer::QMARK) {
+                        nongreedy = true;
+                        m_cur_token = m_lexer.get_next_token();
+                    }
+                    node = Repeat::makePlus(std::move(node), nongreedy);
                     break;
                 }
                 case RegexLexer::QMARK: {
                     m_cur_token = m_lexer.get_next_token();
-                    // Implement ? syntax (0 or 1 times)
-                    auto alt = std::make_unique<Alternative>();
-                    alt->Append(std::make_unique<Match>('\0')); // Empty match
-                    alt->Append(std::move(node));
-                    node = std::move(alt);
+                    // 实现?量词: 转换为{0,1} 
+                    bool nongreedy = false;
+                    if (m_cur_token.type == RegexLexer::QMARK) {
+                        nongreedy = true;
+                        m_cur_token = m_lexer.get_next_token();
+                    }
+                    node = Repeat::makeRange(std::move(node), 0, 1, nongreedy);
+                    break;
+                }
+                case RegexLexer::LBRACE: {
+                    // 解析{n}, {n,}, {n,m}，处理非贪婪以及异常格式
+                    int min = 0, max = -1;
+                    bool nongreedy = false;
+                    m_cur_token = m_lexer.get_next_token();
+                    // 首先读min
+                    if (m_cur_token.type != RegexLexer::CHAR || !isdigit(m_cur_token.value))
+                        throw std::runtime_error("Malformed quantifier: expected digit after '{'");
+                    min = m_cur_token.value - '0';
+                    m_cur_token = m_lexer.get_next_token();
+                    while (m_cur_token.type == RegexLexer::CHAR && isdigit(m_cur_token.value)) {
+                        min = min * 10 + (m_cur_token.value - '0');
+                        m_cur_token = m_lexer.get_next_token();
+                    }
+                    if (m_cur_token.type == RegexLexer::COMMA) {
+                        // {n,}
+                        m_cur_token = m_lexer.get_next_token();
+                        if (m_cur_token.type == RegexLexer::CHAR && isdigit(m_cur_token.value)) {
+                            // {n,m}
+                            max = m_cur_token.value - '0';
+                            m_cur_token = m_lexer.get_next_token();
+                            while (m_cur_token.type == RegexLexer::CHAR && isdigit(m_cur_token.value)) {
+                                max = max * 10 + (m_cur_token.value - '0');
+                                m_cur_token = m_lexer.get_next_token();
+                            }
+                        }
+                        // else {n,} 型, max已是-1
+                    } else {
+                        // {n} 精确
+                        max = min;
+                    }
+                    if (m_cur_token.type != RegexLexer::RBRACE)
+                        throw std::runtime_error("Malformed quantifier: missing '}'");
+                    m_cur_token = m_lexer.get_next_token();
+                    // 溯源贪婪/非贪婪?
+                    if (m_cur_token.type == RegexLexer::QMARK) {
+                        nongreedy = true;
+                        m_cur_token = m_lexer.get_next_token();
+                    }
+                    if (min < 0 || (max >= 0 && max < min))
+                        throw std::runtime_error("Malformed quantifier: nonsensical range");
+                    node = Repeat::makeRange(std::move(node), min, max, nongreedy);
                     break;
                 }
                 default:
