@@ -167,6 +167,15 @@ Value* Concat::CodeGen() {
     }else {
       (*It)->SetSuccessBlock(GetSuccessBlock());
       (*It)->CodeGen();
+
+      // After the last element, if it consumes characters, increment index
+      // This ensures that after matching the full pattern, index points to the end
+      if (dynamic_cast<Anchor*>(It->get()) == nullptr) {
+        // Get current index after the last element
+        Value *CurI = Builder.CreateLoad(Builder.getInt32Ty(), Index);
+        Value *NextI = Builder.CreateAdd(CurI, ConstantInt::get(Context, APInt(32, 1)));
+        Builder.CreateStore(NextI, Index);
+      }
     }
     It++;
   }
