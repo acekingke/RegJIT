@@ -54,75 +54,12 @@ void ensureJITInitialized() {
   }
 }
 
-// compile or get cached compiled entry
-CompiledEntry getOrCompile(const std::string &pattern) {
-  // Check cache
-  {
-    std::lock_guard<std::mutex> lk(CompileCacheMutex);
-    auto it = CompileCache.find(pattern);
-    if (it != CompileCache.end()) return it->second;
-  }
-
-  ensureJITInitialized();
-
-  // generate unique function/module name
-  uint64_t id = GlobalFnId.fetch_add(1);
-  std::hash<std::string> hasher;
-  auto h = hasher(pattern);
-  FunctionName = "regjit_match_" + std::to_string(h) + "_" + std::to_string(id);
-
-  // create fresh module for this compile
-  ThisModule = std::make_unique<Module>("module_" + std::to_string(id), Context);
-  ThisModule->setDataLayout(JIT->getDataLayout());
-
-  // parse and codegen
-  try {
-    RegexLexer lexer(pattern);
-    RegexParser parser(lexer);
-    auto ast = parser.parse();
-    auto func = std::make_unique<Func>(std::move(ast));
-    func->CodeGen();
-  } catch (const std::exception &e) {
-    throw;
-  }
-
-  // Optimize
-  OptimizeModule(*ThisModule);
-
-  // Add to JIT with its own resource tracker
-  auto localRT = JIT->getMainJITDylib().createResourceTracker();
-  auto TSCtx = std::make_unique<LLVMContext>();
-  ThreadSafeContext SafeCtx(std::move(TSCtx));
-  ExitOnErr(JIT->addIRModule(localRT, ThreadSafeModule(std::move(ThisModule), SafeCtx)));
-
-  // Lookup symbol
-  auto Sym = ExitOnErr(JIT->lookup(FunctionName));
-  uint64_t addr = Sym.getAddress();
-
-  CompiledEntry e;
-  e.Addr = addr;
-  e.RT = localRT;
-  e.FnName = FunctionName;
-
-  {
-    std::lock_guard<std::mutex> lk(CompileCacheMutex);
-    CompileCache.emplace(pattern, e);
-  }
-
-  return e;
-}
+// (Compilation/caching implementation moved; use CompileRegex for now.)
 
 int ExecutePattern(const std::string& pattern, const char* input) {
-  CompiledEntry e;
-  try {
-    e = getOrCompile(pattern);
-  } catch (...) {
-    return -1;
-  }
-  auto fn = reinterpret_cast<int (*)(const char*)>(e.Addr);
-  int rc = fn(input);
-  outs() << "\nProgram exited with code: " << rc << "\n";
-  return rc;
+  // compile the pattern (CompileRegex generates function named 'match')
+  if (!CompileRegex(pattern)) return -1;
+  return Execute(input);
 }
 
 void unloadPattern(const std::string& pattern) {
@@ -138,7 +75,11 @@ void unloadPattern(const std::string& pattern) {
 // C API implementations
 int regjit_compile(const char* pattern, char** err_msg) {
   try {
-    getOrCompile(std::string(pattern));
+    bool ok = CompileRegex(std::string(pattern));
+    if (!ok) {
+      if (err_msg) *err_msg = strdup("compile failed");
+      return 0;
+    }
     return 1;
   } catch (const std::exception &e) {
     if (err_msg) *err_msg = strdup(e.what());
@@ -160,11 +101,14 @@ int regjit_match(const char* pattern, const char* buf, size_t len) {
   } else {
     cstr = buf;
   }
-  return ExecutePattern(std::string(pattern), cstr);
+  // Execute the last compiled function (CompileRegex sets up module named 'match')
+  (void)pattern; // ignore pattern (compat with simple API)
+  return Execute(cstr);
 }
 
 void regjit_unload(const char* pattern) {
-  unloadPattern(std::string(pattern));
+  (void)pattern;
+  CleanUp();
 }
 
 // Add optimization passes
