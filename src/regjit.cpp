@@ -1,6 +1,7 @@
 #include "regjit.h"
 #include <iostream>
 #include <stdexcept>
+#include "regjit_capi.h"
 
   ExitOnError ExitOnErr;
   LLVMContext Context;
@@ -132,6 +133,38 @@ void unloadPattern(const std::string& pattern) {
     ExitOnErr(it->second.RT->remove());
   }
   CompileCache.erase(it);
+}
+
+// C API implementations
+int regjit_compile(const char* pattern, char** err_msg) {
+  try {
+    getOrCompile(std::string(pattern));
+    return 1;
+  } catch (const std::exception &e) {
+    if (err_msg) *err_msg = strdup(e.what());
+    return 0;
+  }
+}
+
+int regjit_match(const char* pattern, const char* buf, size_t len) {
+  // Our generated function expects null-terminated C string; ensure termination
+  // For performance we avoid copying if buf[len]==0; otherwise copy to temp buffer
+  bool need_copy = false;
+  if (len == 0 || buf[len-1] != '\0') need_copy = true;
+  std::string tmp;
+  const char* cstr = nullptr;
+  if (need_copy) {
+    tmp.assign(buf, len);
+    tmp.push_back('\0');
+    cstr = tmp.c_str();
+  } else {
+    cstr = buf;
+  }
+  return ExecutePattern(std::string(pattern), cstr);
+}
+
+void regjit_unload(const char* pattern) {
+  unloadPattern(std::string(pattern));
 }
 
 // Add optimization passes
