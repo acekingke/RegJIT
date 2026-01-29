@@ -6,6 +6,21 @@ CXXFLAGS += $(shell $(LLVM_CONFIG) --cxxflags)
 LDFLAGS  := $(shell $(LLVM_CONFIG) --ldflags)
 LDLIBS   := $(shell $(LLVM_CONFIG) --libs core)
 
+# pybind11 settings
+PYBIND11_INCLUDE := $(shell python3 -m pybind11 --includes 2>/dev/null || echo "-I/usr/include/python3")
+
+# Build shared lib for regjit core
+libregjit.so: src/regjit.o
+	$(CXX) -shared -fPIC -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+# Python extension module (_regjit) using pybind11
+python/_regjit.so: libregjit.so python/bindings.cpp
+	$(CXX) $(CXXFLAGS) $(PYBIND11_INCLUDE) -I./src -fPIC -shared -o $@ python/bindings.cpp libregjit.so $(LDFLAGS) $(LDLIBS)
+
+.PHONY: python-bindings
+python-bindings: python/_regjit.so
+	@echo "Built python bindings: python/_regjit.so"
+
 # Source and object files
 SRC = src/test.cpp src/regjit.cpp
 OBJ = $(SRC:.cpp=.o)
