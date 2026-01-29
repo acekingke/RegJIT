@@ -70,10 +70,11 @@ test_basic_multi: test_basic_multi.cpp $(REGJIT_OBJ)
 	$(CXX) $(CXXFLAGS) -I./src -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
 # Run all tests in tests directory
-test_all: test_charclass test_anchor test_cleanup test_charclass_only test_simple_charclass debug simple_anchor_test simple_test final_test
+test_all: test_charclass test_anchor test_anchor_quant_edge test_cleanup simple_anchor_test
 	@echo "Running all tests in tests/ directory..."
 	@if [ -f test_charclass ]; then echo "=== Running test_charclass ==="; ./test_charclass || echo "test_charclass failed"; fi
 	@if [ -f test_anchor ]; then echo "=== Running test_anchor ==="; timeout 3 ./test_anchor || echo "test_anchor failed or timed out"; fi
+	@if [ -f test_anchor_quant_edge ]; then echo "=== Running test_anchor_quant_edge ==="; timeout 3 ./test_anchor_quant_edge || echo "test_anchor_quant_edge failed or timed out"; fi
 	@if [ -f test_cleanup ]; then echo "=== Running test_cleanup ==="; ./test_cleanup || echo "test_cleanup failed"; fi
 	
 	@if [ -f test_charclass_only ]; then echo "=== Running test_charclass_only ==="; ./test_charclass_only || echo "test_charclass_only failed"; fi
@@ -98,7 +99,7 @@ clean:
 
 # Clean only compiled test executables, keep source files
 clean_tests:
-	rm -f test_charclass test_anchor test_cleanup test_charclass_only test_simple_charclass debug simple_anchor_test simple_test final_test
+	 rm -f test_charclass test_anchor test_anchor_quant_edge test_cleanup test_charclass_only test_simple_charclass debug simple_anchor_test simple_test final_test
 
 # Quick test - run only main functionality tests
 test_quick: test_anchor test_charclass

@@ -177,10 +177,8 @@ public:
 };
 void Initialize();
 void Compile();
-void CompileRegex(const std::string& pattern);
+bool CompileRegex(const std::string& pattern);
 int Execute(const char* input);
 void CleanUp();
-
-
 
 

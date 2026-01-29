@@ -1,4 +1,6 @@
 #include "regjit.h"
+#include <iostream>
+#include <stdexcept>
 
   ExitOnError ExitOnErr;
   LLVMContext Context;
@@ -13,14 +15,24 @@
   const std::string FalseBlockName("FalseBlock");
   Value *Index;
   Value *Arg0;
+  Value *StrLenAlloca = nullptr;
   
 
 void Initialize() {
    ThisModule =  std::make_unique<Module>("my_module", Context);
     InitializeNativeTarget();
     InitializeNativeTargetAsmPrinter();
-    JIT = ExitOnErr(LLJITBuilder().create());
-    ThisModule->setDataLayout(JIT->getDataLayout());
+  JIT = ExitOnErr(LLJITBuilder().create());
+  ThisModule->setDataLayout(JIT->getDataLayout());
+  // Allow the JIT to resolve symbols from the host process (e.g. libc's strlen)
+  JIT->getMainJITDylib().addGenerator(
+      cantFail(llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+          JIT->getDataLayout().getGlobalPrefix())));
+
+  // We compute string length inline inside Func::CodeGen to avoid depending
+  // on host libc symbol resolution (e.g. renamed variants like "strlen.1").
+  // Keep DynamicLibrarySearchGenerator in case other external symbols are
+  // required by generated code.
   
   if (verifyModule(*ThisModule, &errs())) {
     errs() << "Error verifying module!\n";
@@ -109,14 +121,42 @@ Value* Func::CodeGen() {
     Index = Builder.CreateAlloca(Builder.getInt32Ty());
     Builder.CreateStore(ConstantInt::get(Context, APInt(32, 0)), Index);
     
-    // Compute string length (needed for search)
-    Function *StrlenF = Function::Create(
-        FunctionType::get(Builder.getInt32Ty(), {Builder.getInt8Ty()->getPointerTo()}, false),
-        Function::ExternalLinkage,
-        "strlen",
-        ThisModule.get()
-    );
-    Value *strlenVal = Builder.CreateCall(StrlenF, {Arg0});
+    // Compute string length inline (avoid external strlen calls which can
+    // produce renamed declarations like "strlen.1" across module boundaries
+    // and complicate JIT symbol resolution on some platforms).
+    StrLenAlloca = Builder.CreateAlloca(Builder.getInt32Ty());
+    // temp index for strlen loop
+    Value *lenIdx = Builder.CreateAlloca(Builder.getInt32Ty());
+    Builder.CreateStore(ConstantInt::get(Context, APInt(32, 0)), lenIdx);
+
+    BasicBlock *StrlenCondBB = BasicBlock::Create(Context, "strlen_cond", MatchF);
+    BasicBlock *StrlenBodyBB = BasicBlock::Create(Context, "strlen_body", MatchF);
+    BasicBlock *StrlenDoneBB = BasicBlock::Create(Context, "strlen_done", MatchF);
+
+    // Jump to condition
+    Builder.CreateBr(StrlenCondBB);
+
+    // Condition: load char at cur index and test null
+    Builder.SetInsertPoint(StrlenCondBB);
+    Value *curLen = Builder.CreateLoad(Builder.getInt32Ty(), lenIdx);
+    Value *charPtr = Builder.CreateGEP(Builder.getInt8Ty(), Arg0, {curLen});
+    Value *ch = Builder.CreateLoad(Builder.getInt8Ty(), charPtr);
+    Value *isNull = Builder.CreateICmpEQ(ch, ConstantInt::get(Context, APInt(8, 0)));
+    Builder.CreateCondBr(isNull, StrlenDoneBB, StrlenBodyBB);
+
+    // Body: increment index and jump back to condition
+    Builder.SetInsertPoint(StrlenBodyBB);
+    Value *nextLen = Builder.CreateAdd(curLen, ConstantInt::get(Context, APInt(32, 1)));
+    Builder.CreateStore(nextLen, lenIdx);
+    Builder.CreateBr(StrlenCondBB);
+
+    // Done: store final length
+    Builder.SetInsertPoint(StrlenDoneBB);
+    Value *finalLen = Builder.CreateLoad(Builder.getInt32Ty(), lenIdx);
+    Builder.CreateStore(finalLen, StrLenAlloca);
+
+    // Load strlenVal from the alloca for use in the search loop
+    Value *strlenVal = Builder.CreateLoad(Builder.getInt32Ty(), StrLenAlloca);
     
     // Create search loop basic blocks
     BasicBlock *LoopCheckBB = BasicBlock::Create(Context, "search_loop_check", MatchF);
@@ -229,26 +269,23 @@ void Alternative::Append(std::unique_ptr<Root> r) {
   BodyVec.push_back(std::move(r));
 }
 Value* Alternative::CodeGen() {
-  auto  It = BodyVec.begin();
-  while (It != BodyVec.end()) {
-    auto NextIt = It+1;
-    BasicBlock* SuccessBlock;
-    (*It)->SetSuccessBlock(GetSuccessBlock()); // Match success
-    if (NextIt != BodyVec.end()) {
-      auto failBlock =  BasicBlock::Create(Context, "out", MatchF);
-      (*It)->SetFailBlock(failBlock);
+   auto  It = BodyVec.begin();
+   while (It != BodyVec.end()) {
+     auto NextIt = It+1;
+     (*It)->SetSuccessBlock(GetSuccessBlock()); // Match success
+     if (NextIt != BodyVec.end()) {
+       auto failBlock =  BasicBlock::Create(Context, "out", MatchF);
+       (*It)->SetFailBlock(failBlock);
 
-      (*It)->CodeGen();
-      Builder.SetInsertPoint(failBlock);
-      Value *CurI = Builder.CreateLoad(Builder.getInt32Ty(), Index);
-      Value *NextI = Builder.CreateAdd(CurI, ConstantInt::get(Context, APInt(32, 1)));
-    }else {
-      (*It)->SetFailBlock(GetFailBlock());
-      (*It)->CodeGen();
-    }
-    It++;
-  }
-  return nullptr;
+       (*It)->CodeGen();
+       Builder.SetInsertPoint(failBlock);
+     }else {
+       (*It)->SetFailBlock(GetFailBlock());
+       (*It)->CodeGen();
+     }
+     It++;
+   }
+   return nullptr;
 }
 Value* Not::CodeGen(){
   Body->SetFailBlock(GetSuccessBlock());
@@ -291,10 +328,9 @@ Value* Repeat::CodeGen() {
         Builder.SetInsertPoint(finalBlock);
         Builder.CreateBr(GetSuccessBlock());
         return nullptr;
-    }
-    // 通用支持 minCount/maxCount/nonGreedy 的量词
-    BasicBlock* entry = Builder.GetInsertBlock();
-    auto intTy = Builder.getInt32Ty();
+     }
+     // 通用支持 minCount/maxCount/nonGreedy 的量词
+     auto intTy = Builder.getInt32Ty();
     // 精确重复，直接循环min次
     if (minCount == maxCount && minCount > 0) {
         Value* counter = Builder.CreateAlloca(intTy);
@@ -516,14 +552,31 @@ class RegexParser {
     }
 
     std::unique_ptr<Root> parse_element() {
-        if (m_cur_token.type == RegexLexer::LPAREN) {
+    if (m_cur_token.type == RegexLexer::LPAREN) {
+            // Support normal groups and non-capturing groups like (?:...)
             m_cur_token = m_lexer.get_next_token();
-            auto expr = parse_expr();
-            if (m_cur_token.type != RegexLexer::RPAREN) {
-                throw std::runtime_error("Mismatched parentheses");
+            if (m_cur_token.type == RegexLexer::QMARK) {
+                // Expect ':' for non-capturing group
+                m_cur_token = m_lexer.get_next_token();
+                if (!(m_cur_token.type == RegexLexer::CHAR && m_cur_token.value == ':')) {
+                    throw std::runtime_error("Unsupported group modifier");
+                }
+                // Move to next token after ':' and parse group body
+                m_cur_token = m_lexer.get_next_token();
+                auto expr = parse_expr();
+                if (m_cur_token.type != RegexLexer::RPAREN) {
+                    throw std::runtime_error("Mismatched parentheses");
+                }
+                m_cur_token = m_lexer.get_next_token();
+                return expr;
+            } else {
+                auto expr = parse_expr();
+                if (m_cur_token.type != RegexLexer::RPAREN) {
+                    throw std::runtime_error("Mismatched parentheses");
+                }
+                m_cur_token = m_lexer.get_next_token();
+                return expr;
             }
-            m_cur_token = m_lexer.get_next_token();
-            return expr;
         } else if (m_cur_token.type == RegexLexer::DOT) {
             m_cur_token = m_lexer.get_next_token();
             return std::make_unique<CharClass>(false, true); // dot class
@@ -742,31 +795,17 @@ Value* Anchor::CodeGen() {
         }
         case End: {
             // $ matches at the end of the string (index == strlen)
-            Value* strLen = Builder.CreateCall(
-                Function::Create(
-                    FunctionType::get(Builder.getInt32Ty(), {Builder.getInt8Ty()->getPointerTo()}, false),
-                    Function::ExternalLinkage,
-                    "strlen",
-                    ThisModule.get()
-                ),
-                {Arg0}
-            );
+            // Use the precomputed inline strlen value stored in StrLenAlloca
+            Value* strLen = Builder.CreateLoad(Builder.getInt32Ty(), StrLenAlloca);
             match = Builder.CreateICmpEQ(curIdx, strLen);
             break;
         }
         case WordBoundary: {
             // \b matches at word boundaries (transition between \w and \W)
             // Check if current position is at string boundaries
-            Value* strLen = Builder.CreateCall(
-                Function::Create(
-                    FunctionType::get(Builder.getInt32Ty(), {Builder.getInt8Ty()->getPointerTo()}, false),
-                    Function::ExternalLinkage,
-                    "strlen",
-                    ThisModule.get()
-                ),
-                {Arg0}
-            );
-            
+            // Use precomputed inline strlen value
+            Value* strLen = Builder.CreateLoad(Builder.getInt32Ty(), StrLenAlloca);
+
             Value* atStart = Builder.CreateICmpEQ(curIdx, 
                 ConstantInt::get(Context, APInt(32, 0)));
             Value* atEnd = Builder.CreateICmpEQ(curIdx, strLen);
@@ -833,27 +872,28 @@ Value* Anchor::CodeGen() {
         case NonWordBoundary: {
             // \B matches at non-word boundaries
             // This is the negation of \b
-            // For simplicity, we'll implement this as a separate check
-            Value* strLen = Builder.CreateCall(
-                Function::Create(
-                    FunctionType::get(Builder.getInt32Ty(), {Builder.getInt8Ty()->getPointerTo()}, false),
-                    Function::ExternalLinkage,
-                    "strlen",
-                    ThisModule.get()
-                ),
-                {Arg0}
-            );
-            
+            // Use precomputed inline strlen value
+            Value* strLen = Builder.CreateLoad(Builder.getInt32Ty(), StrLenAlloca);
+
             Value* atStart = Builder.CreateICmpEQ(curIdx, 
                 ConstantInt::get(Context, APInt(32, 0)));
             Value* atEnd = Builder.CreateICmpEQ(curIdx, strLen);
             Value* atBoundary = Builder.CreateOr(atStart, atEnd);
             
-            // If at boundary, this is not a non-word boundary
+            // Special case: at string start/end with empty string (strLen == 0),
+            // the position is non-word-to-non-word (both imaginary), so \B succeeds
+            Value* isEmpty = Builder.CreateICmpEQ(strLen, ConstantInt::get(Context, APInt(32, 0)));
+            
+            // If at real boundary (non-empty string), fail immediately
+            // If at empty string boundary, succeed
+            // Otherwise check character transition
+            BasicBlock* boundaryBlock = Builder.GetInsertBlock();  // Capture the block before branching
             BasicBlock* checkTransition = BasicBlock::Create(Context, "check_nonword_transition", MatchF);
             BasicBlock* endCheck = BasicBlock::Create(Context, "end_nonword_check", MatchF);
             
-            Builder.CreateCondBr(atBoundary, endCheck, checkTransition);
+            // Branch: if (atBoundary && !isEmpty) goto endCheck with false, else goto checkTransition
+            Value* realBoundary = Builder.CreateAnd(atBoundary, Builder.CreateNot(isEmpty));
+            Builder.CreateCondBr(realBoundary, endCheck, checkTransition);
             
             // Check character transition (same as \b but negated)
             Builder.SetInsertPoint(checkTransition);
@@ -897,15 +937,17 @@ Value* Anchor::CodeGen() {
             Value* bothNonWord = Builder.CreateAnd(Builder.CreateNot(curIsWord), Builder.CreateNot(prevIsWord));
             Value* isNonBoundary = Builder.CreateOr(bothWord, bothNonWord);
             
-            Builder.CreateBr(endCheck);
-            
-            // Combine results
-            Builder.SetInsertPoint(endCheck);
-            PHINode* result = Builder.CreatePHI(Builder.getInt1Ty(), 2);
-            result->addIncoming(ConstantInt::get(Context, APInt(1, 0)), atBoundary ? Builder.GetInsertBlock() : Builder.GetInsertBlock());
-            result->addIncoming(isNonBoundary, checkTransition);
-            
-            match = result;
+              Builder.CreateBr(endCheck);
+              
+              // Combine results
+              Builder.SetInsertPoint(endCheck);
+              PHINode* result = Builder.CreatePHI(Builder.getInt1Ty(), 2);
+              // Real boundary (non-empty string): fail
+              result->addIncoming(ConstantInt::get(Context, APInt(1, 0)), boundaryBlock);
+              // Character transition check result (or empty string case which goes through checkTransition)
+              result->addIncoming(isNonBoundary, checkTransition);
+              
+              match = result;
             break;
         }
     }
@@ -917,12 +959,27 @@ Value* Anchor::CodeGen() {
 }
 
 // New JIT compilation interface
-void CompileRegex(const std::string& pattern) {
-    RegexLexer lexer(pattern);
-    RegexParser parser(lexer);
-    auto ast = parser.parse();
-    auto func = std::make_unique<Func>(std::move(ast));
-    func->CodeGen();
-    Compile();
+bool CompileRegex(const std::string& pattern) {
+    // Debug: show tokenization to help locate parser errors
+    {
+        RegexLexer tmp(pattern);
+        std::cerr << "Lexer tokens for pattern: '" << pattern << "'\n";
+        while (true) {
+            auto t = tmp.get_next_token();
+            if (t.type == RegexLexer::EOS) { std::cerr << "  <EOS>\n"; break; }
+            std::cerr << "  token: " << t.type << " value:'" << t.value << "'\n";
+        }
+    }
+    try {
+        RegexLexer lexer(pattern);
+        RegexParser parser(lexer);
+        auto ast = parser.parse();
+        auto func = std::make_unique<Func>(std::move(ast));
+        func->CodeGen();
+        Compile();
+        return true;
+    } catch (const std::exception &e) {
+        std::cerr << "CompileRegex failed for pattern '" << pattern << "': " << e.what() << "\n";
+        return false;
+    }
 }
-
