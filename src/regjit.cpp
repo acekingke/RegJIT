@@ -5,11 +5,15 @@
   ExitOnError ExitOnErr;
   LLVMContext Context;
   IRBuilder<> Builder(Context);
-  std::unique_ptr<Module>ThisModule = nullptr;
-  std::unique_ptr<llvm::orc::LLJIT> JIT;
-  llvm::orc::ResourceTrackerSP RT;
-  Function *MatchF;
-  const std::string FunctionName("match");
+   std::unique_ptr<Module>ThisModule = nullptr;
+   std::unique_ptr<llvm::orc::LLJIT> JIT;
+   llvm::orc::ResourceTrackerSP RT;
+   Function *MatchF;
+   std::string FunctionName("match");
+   // Compilation cache and helpers
+   std::unordered_map<std::string, CompiledEntry> CompileCache;
+   std::mutex CompileCacheMutex;
+   std::atomic<uint64_t> GlobalFnId{0};
   const std::string FunArgName("Arg0");
   const std::string TrueBlockName("TrueBlock");
   const std::string FalseBlockName("FalseBlock");
@@ -19,10 +23,12 @@
   
 
 void Initialize() {
-   ThisModule =  std::make_unique<Module>("my_module", Context);
-    InitializeNativeTarget();
-    InitializeNativeTargetAsmPrinter();
-  JIT = ExitOnErr(LLJITBuilder().create());
+   if (!JIT) {
+     InitializeNativeTarget();
+     InitializeNativeTargetAsmPrinter();
+     JIT = ExitOnErr(LLJITBuilder().create());
+   }
+  ThisModule =  std::make_unique<Module>("my_module", Context);
   ThisModule->setDataLayout(JIT->getDataLayout());
   // Allow the JIT to resolve symbols from the host process (e.g. libc's strlen)
   JIT->getMainJITDylib().addGenerator(
@@ -39,6 +45,93 @@ void Initialize() {
     return;
   }
 
+}
+
+void ensureJITInitialized() {
+  if (!JIT) {
+    Initialize();
+  }
+}
+
+// compile or get cached compiled entry
+CompiledEntry getOrCompile(const std::string &pattern) {
+  // Check cache
+  {
+    std::lock_guard<std::mutex> lk(CompileCacheMutex);
+    auto it = CompileCache.find(pattern);
+    if (it != CompileCache.end()) return it->second;
+  }
+
+  ensureJITInitialized();
+
+  // generate unique function/module name
+  uint64_t id = GlobalFnId.fetch_add(1);
+  std::hash<std::string> hasher;
+  auto h = hasher(pattern);
+  FunctionName = "regjit_match_" + std::to_string(h) + "_" + std::to_string(id);
+
+  // create fresh module for this compile
+  ThisModule = std::make_unique<Module>("module_" + std::to_string(id), Context);
+  ThisModule->setDataLayout(JIT->getDataLayout());
+
+  // parse and codegen
+  try {
+    RegexLexer lexer(pattern);
+    RegexParser parser(lexer);
+    auto ast = parser.parse();
+    auto func = std::make_unique<Func>(std::move(ast));
+    func->CodeGen();
+  } catch (const std::exception &e) {
+    throw;
+  }
+
+  // Optimize
+  OptimizeModule(*ThisModule);
+
+  // Add to JIT with its own resource tracker
+  auto localRT = JIT->getMainJITDylib().createResourceTracker();
+  auto TSCtx = std::make_unique<LLVMContext>();
+  ThreadSafeContext SafeCtx(std::move(TSCtx));
+  ExitOnErr(JIT->addIRModule(localRT, ThreadSafeModule(std::move(ThisModule), SafeCtx)));
+
+  // Lookup symbol
+  auto Sym = ExitOnErr(JIT->lookup(FunctionName));
+  uint64_t addr = Sym.getAddress();
+
+  CompiledEntry e;
+  e.Addr = addr;
+  e.RT = localRT;
+  e.FnName = FunctionName;
+
+  {
+    std::lock_guard<std::mutex> lk(CompileCacheMutex);
+    CompileCache.emplace(pattern, e);
+  }
+
+  return e;
+}
+
+int ExecutePattern(const std::string& pattern, const char* input) {
+  CompiledEntry e;
+  try {
+    e = getOrCompile(pattern);
+  } catch (...) {
+    return -1;
+  }
+  auto fn = reinterpret_cast<int (*)(const char*)>(e.Addr);
+  int rc = fn(input);
+  outs() << "\nProgram exited with code: " << rc << "\n";
+  return rc;
+}
+
+void unloadPattern(const std::string& pattern) {
+  std::lock_guard<std::mutex> lk(CompileCacheMutex);
+  auto it = CompileCache.find(pattern);
+  if (it == CompileCache.end()) return;
+  if (it->second.RT) {
+    ExitOnErr(it->second.RT->remove());
+  }
+  CompileCache.erase(it);
 }
 
 // Add optimization passes

@@ -22,6 +22,10 @@
 #include <llvm/Analysis/LoopAnalysisManager.h>
 #include <llvm/Analysis/CGSCCPassManager.h>
 #include <llvm/Passes/OptimizationLevel.h>
+#include <unordered_map>
+#include <mutex>
+#include <atomic>
+#include <string>
 
 using namespace llvm;
 using namespace llvm::orc;
@@ -31,6 +35,17 @@ using namespace llvm::orc;
   extern llvm::IRBuilder<> Builder;
   extern   ExitOnError ExitOnErr;
   extern std::unique_ptr<llvm::orc::LLJIT> JIT;
+  
+  struct CompiledEntry {
+    uint64_t Addr; // JIT absolute address
+    llvm::orc::ResourceTrackerSP RT; // tracker to allow unloading
+    std::string FnName; // generated function name
+  };
+
+  extern std::unordered_map<std::string, CompiledEntry> CompileCache;
+  extern std::mutex CompileCacheMutex;
+  extern std::atomic<uint64_t> GlobalFnId;
+  extern std::string FunctionName; // current/last generated function name
 class Root {
     BasicBlock* failBlock;
     BasicBlock* nextBlock;
@@ -178,7 +193,9 @@ public:
 void Initialize();
 void Compile();
 bool CompileRegex(const std::string& pattern);
-int Execute(const char* input);
+void ensureJITInitialized();
+bool CompileRegex(const std::string& pattern);
+int Execute(const char* input); // execute last compiled function
+int ExecutePattern(const std::string& pattern, const char* input); // compile-or-get then execute
+void unloadPattern(const std::string& pattern);
 void CleanUp();
-
-
