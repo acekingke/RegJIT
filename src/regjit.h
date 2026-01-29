@@ -40,12 +40,24 @@ using namespace llvm::orc;
     uint64_t Addr; // JIT absolute address
     llvm::orc::ResourceTrackerSP RT; // tracker to allow unloading
     std::string FnName; // generated function name
+    size_t refCount = 0; // number of active users
+    std::list<std::string>::iterator lruIt; // iterator into LRU list
   };
 
   extern std::unordered_map<std::string, CompiledEntry> CompileCache;
   extern std::mutex CompileCacheMutex;
   extern std::atomic<uint64_t> GlobalFnId;
   extern std::string FunctionName; // current/last generated function name
+  extern size_t CacheMaxSize;
+  #include <list>
+  extern std::list<std::string> CacheLRUList;
+  extern size_t CacheMaxSize;
+  extern std::list<std::string> CacheLRUList;
+
+  // cache management
+  CompiledEntry getOrCompile(const std::string &pattern);
+  void releasePattern(const std::string &pattern);
+  void evictIfNeeded();
 class Root {
     BasicBlock* failBlock;
     BasicBlock* nextBlock;

@@ -7,7 +7,10 @@ LDFLAGS  := $(shell $(LLVM_CONFIG) --ldflags)
 LDLIBS   := $(shell $(LLVM_CONFIG) --libs core)
 
 # pybind11 settings
-PYBIND11_INCLUDE := $(shell python3 -m pybind11 --includes 2>/dev/null || echo "-I/usr/include/python3")
+PYBIND11_INCLUDE := -I/usr/local/include/pybind11
+# Use python3.12 for building python bindings
+PYTHON_BIN := python3.12
+PYTHON_INCLUDES := -I$(shell $(PYTHON_BIN) -c "import sysconfig; p=sysconfig.get_paths(); print(p['include'])")
 
 # Build shared lib for regjit core
 libregjit.so: src/regjit.o
@@ -15,7 +18,7 @@ libregjit.so: src/regjit.o
 
 # Python extension module (_regjit) using pybind11
 python/_regjit.so: libregjit.so python/bindings.cpp
-	$(CXX) $(CXXFLAGS) $(PYBIND11_INCLUDE) -I./src -fPIC -shared -o $@ python/bindings.cpp libregjit.so $(LDFLAGS) $(LDLIBS)
+	$(CXX) $(CXXFLAGS) $(PYBIND11_INCLUDE) $(PYTHON_INCLUDES) -I./src -fPIC -shared -o $@ python/bindings.cpp libregjit.so $(LDFLAGS) $(LDLIBS) -undefined dynamic_lookup
 
 .PHONY: python-bindings
 python-bindings: python/_regjit.so

@@ -1,5 +1,4 @@
 #include <pybind11/pybind11.h>
-#include <pybind11/bytes.h>
 #include <pybind11/stl.h>
 #include <stdexcept>
 #include <cstdlib>

@@ -15,6 +15,8 @@
    std::unordered_map<std::string, CompiledEntry> CompileCache;
    std::mutex CompileCacheMutex;
    std::atomic<uint64_t> GlobalFnId{0};
+   size_t CacheMaxSize = 64; // default max entries
+   std::list<std::string> CacheLRUList;
   const std::string FunArgName("Arg0");
   const std::string TrueBlockName("TrueBlock");
   const std::string FalseBlockName("FalseBlock");
@@ -54,7 +56,50 @@ void ensureJITInitialized() {
   }
 }
 
-// (Compilation/caching implementation moved; use CompileRegex for now.)
+// compile-or-get with cache. This uses CompileRegex which generates IR into
+// the global ThisModule and calls Compile() to add it to the JIT. We hold
+// CompileCacheMutex during compilation to avoid races and RT being overwritten.
+CompiledEntry getOrCompile(const std::string &pattern) {
+  // fast check
+  {
+    std::lock_guard<std::mutex> lk(CompileCacheMutex);
+    auto it = CompileCache.find(pattern);
+    if (it != CompileCache.end()) return it->second;
+  }
+
+  std::lock_guard<std::mutex> lk(CompileCacheMutex);
+  // double-check
+  auto it = CompileCache.find(pattern);
+  if (it != CompileCache.end()) return it->second;
+
+  ensureJITInitialized();
+
+  uint64_t id = GlobalFnId.fetch_add(1);
+  std::hash<std::string> hasher;
+  auto h = hasher(pattern);
+  FunctionName = "regjit_match_" + std::to_string(h) + "_" + std::to_string(id);
+
+  // create fresh module for this compile
+  ThisModule = std::make_unique<Module>("module_" + std::to_string(id), Context);
+  ThisModule->setDataLayout(JIT->getDataLayout());
+
+  // Call existing CompileRegex which will fill ThisModule and call Compile()
+  if (!CompileRegex(pattern)) {
+    throw std::runtime_error("compile failed");
+  }
+
+  // After Compile(), RT holds the ResourceTracker used for this module
+  auto Sym = ExitOnErr(JIT->lookup(FunctionName));
+  uint64_t addr = Sym.getValue();
+
+  CompiledEntry e;
+  e.Addr = addr;
+  e.RT = RT; // RT set by Compile()
+  e.FnName = FunctionName;
+
+  CompileCache.emplace(pattern, e);
+  return e;
+}
 
 int ExecutePattern(const std::string& pattern, const char* input) {
   // compile the pattern (CompileRegex generates function named 'match')
