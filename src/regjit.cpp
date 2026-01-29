@@ -96,9 +96,56 @@ CompiledEntry getOrCompile(const std::string &pattern) {
   e.Addr = addr;
   e.RT = RT; // RT set by Compile()
   e.FnName = FunctionName;
+  e.refCount = 1;
 
-  CompileCache.emplace(pattern, e);
-  return e;
+  // insert into LRU front
+  CacheLRUList.push_front(pattern);
+  e.lruIt = CacheLRUList.begin();
+
+  CompileCache.emplace(pattern, std::move(e));
+
+  // Evict if needed
+  evictIfNeeded();
+
+  return CompileCache.at(pattern);
+}
+
+// Evict entries until cache size <= CacheMaxSize. Only evict entries with refCount == 0.
+void evictIfNeeded() {
+  while (CompileCache.size() > CacheMaxSize) {
+    if (CacheLRUList.empty()) break;
+    std::string victim = CacheLRUList.back();
+    auto it = CompileCache.find(victim);
+    if (it == CompileCache.end()) {
+      CacheLRUList.pop_back();
+      continue;
+    }
+    if (it->second.refCount == 0) {
+      // remove module via ResourceTracker
+      if (it->second.RT) {
+        ExitOnErr(it->second.RT->remove());
+      }
+      // erase from cache and LRU
+      CacheLRUList.pop_back();
+      CompileCache.erase(it);
+    } else {
+      // cannot evict currently referenced item; stop
+      break;
+    }
+  }
+}
+
+// release a pattern reference (decrement refCount and possibly evict)
+void releasePattern(const std::string &pattern) {
+  std::lock_guard<std::mutex> lk(CompileCacheMutex);
+  auto it = CompileCache.find(pattern);
+  if (it == CompileCache.end()) return;
+  if (it->second.refCount > 0) it->second.refCount--;
+  // move to front of LRU when used? keep as is
+  // if now zero and cache oversized, evict
+  if (it->second.refCount == 0) {
+    evictIfNeeded();
+  }
 }
 
 int ExecutePattern(const std::string& pattern, const char* input) {
