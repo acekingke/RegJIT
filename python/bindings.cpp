@@ -11,14 +11,14 @@ public:
     std::string pattern;
     PyRegex(const std::string &pat) : pattern(pat) {
         char* err = nullptr;
-        if (!regjit_compile(pat.c_str(), &err)) {
-            std::string emsg = err ? std::string(err) : "compile failed";
+        if (!regjit_acquire(pat.c_str(), &err)) {
+            std::string emsg = err ? std::string(err) : "acquire/compile failed";
             if (err) free(err);
             throw std::runtime_error(emsg);
         }
     }
     ~PyRegex() {
-        regjit_unload(pattern.c_str());
+        regjit_release(pattern.c_str());
     }
 
     bool match_bytes(py::bytes b) {
@@ -36,12 +36,17 @@ public:
     }
 };
 
-PYBIND11_MODULE(_regjit, m) {
-    py::class_<PyRegex>(m, "Regex")
-        .def(py::init<const std::string&>())
-        .def("match_bytes", &PyRegex::match_bytes)
-        .def("match", (bool (PyRegex::*)(const std::string&)) &PyRegex::match_str)
-        ;
+    PYBIND11_MODULE(_regjit, m) {
+        py::class_<PyRegex>(m, "Regex")
+            .def(py::init<const std::string&>())
+            .def("match_bytes", &PyRegex::match_bytes)
+            .def("match", (bool (PyRegex::*)(const std::string&)) &PyRegex::match_str)
+            .def("unload", [](PyRegex &r){ regjit_unload(r.pattern.c_str()); })
+            ;
 
     m.def("compile", [](const std::string &pat){ return PyRegex(pat); });
-}
+    m.def("cache_size", [](){ return regjit_cache_size(); });
+    m.def("set_cache_maxsize", [](size_t n){ regjit_set_cache_maxsize(n); });
+    m.def("acquire", [](const std::string &pat){ char* err = nullptr; if (!regjit_acquire(pat.c_str(), &err)) { std::string emsg = err ? std::string(err) : "acquire failed"; if (err) free(err); throw std::runtime_error(emsg); } });
+    m.def("release", [](const std::string &pat){ regjit_release(pat.c_str()); });
+    }

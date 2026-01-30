@@ -26,13 +26,14 @@
 #include <mutex>
 #include <atomic>
 #include <string>
+#include <future>
 
 using namespace llvm;
 using namespace llvm::orc;
 
 
-  extern llvm::LLVMContext Context;
-  extern llvm::IRBuilder<> Builder;
+  extern llvm::LLVMContext* ContextPtr;
+  extern llvm::IRBuilder<>* BuilderPtr;
   extern   ExitOnError ExitOnErr;
   extern std::unique_ptr<llvm::orc::LLJIT> JIT;
   
@@ -46,11 +47,15 @@ using namespace llvm::orc;
 
   extern std::unordered_map<std::string, CompiledEntry> CompileCache;
   extern std::mutex CompileCacheMutex;
+  // Per-pattern in-flight compile coordination to avoid duplicate compilations
+  struct InflightCompile {
+    std::shared_ptr<std::promise<bool>> prom;
+    std::shared_ptr<std::shared_future<bool>> fut;
+  };
+  extern std::unordered_map<std::string, InflightCompile> CompileInflight;
   extern std::atomic<uint64_t> GlobalFnId;
   extern std::string FunctionName; // current/last generated function name
-  extern size_t CacheMaxSize;
   #include <list>
-  extern std::list<std::string> CacheLRUList;
   extern size_t CacheMaxSize;
   extern std::list<std::string> CacheLRUList;
 
@@ -58,14 +63,21 @@ using namespace llvm::orc;
   CompiledEntry getOrCompile(const std::string &pattern);
   void releasePattern(const std::string &pattern);
   void evictIfNeeded();
-class Root {
-    BasicBlock* failBlock;
-    BasicBlock* nextBlock;
+  class Root {
+    BasicBlock* failBlock = nullptr;
+    BasicBlock* nextBlock = nullptr;
 public:
     virtual ~Root() = default;
     virtual Value *CodeGen() = 0;
     // Returns true if this node is zero-width (e.g. anchor, lookaround, etc)
     virtual bool isZeroWidth() const { return false; }
+    // Returns true if the subtree is guaranteed to only match at string start
+    // (i.e. contains an explicit '^' anchor at the leftmost position and all
+    // paths respect that). Conservative default: false.
+    virtual bool isAnchoredAtStart() const { return false; }
+    // Returns true if the subtree contains a Repeat whose body is zero-width
+    // (e.g. repeating an anchor). Conservative default: false.
+    virtual bool containsZeroWidthRepeat() const { return false; }
     void SetFailBlock(BasicBlock *b) {
       failBlock = b;
     }
@@ -103,6 +115,8 @@ public:
     Concat(){}
     void Append(std::unique_ptr<Root> Body);
     Value* CodeGen() override;
+    bool isAnchoredAtStart() const override;
+    bool containsZeroWidthRepeat() const override;
   };
   
   class Alternative: public Root{
@@ -111,6 +125,8 @@ public:
     Alternative(){}
     void Append(std::unique_ptr<Root> Body);
     Value* CodeGen() override;
+    bool isAnchoredAtStart() const override;
+    bool containsZeroWidthRepeat() const override;
   };
   // not operator
   class Not: public Root {
@@ -146,6 +162,10 @@ public:
     }
     Value* CodeGen() override;
     ~Repeat() override = default;
+    bool containsZeroWidthRepeat() const override;
+    // Repeats are not considered anchored at start conservatively because
+    // a repeat may wrap a zero-width anchor and change search semantics.
+    bool isAnchoredAtStart() const override { return false; }
   };
 
 
@@ -200,13 +220,14 @@ public:
     AnchorType getType() const { return anchorType; }
     Value* CodeGen() override;
     bool isZeroWidth() const override { return true; }
+    bool isAnchoredAtStart() const override;
+    bool containsZeroWidthRepeat() const override { return false; }
     ~Anchor() override = default;
-};
+  };
 void Initialize();
 void Compile();
 bool CompileRegex(const std::string& pattern);
 void ensureJITInitialized();
-bool CompileRegex(const std::string& pattern);
 int Execute(const char* input); // execute last compiled function
 int ExecutePattern(const std::string& pattern, const char* input); // compile-or-get then execute
 void unloadPattern(const std::string& pattern);

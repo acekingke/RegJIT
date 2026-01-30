@@ -87,6 +87,9 @@ test_single: test_single.cpp $(REGJIT_OBJ)
 test_basic_multi: test_basic_multi.cpp $(REGJIT_OBJ)
 	$(CXX) $(CXXFLAGS) -I./src -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
+test_wrong: tests/test_wrong.cpp $(REGJIT_OBJ)
+	$(CXX) -DREGJIT_DEBUG $(CXXFLAGS) -I./src -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
 # Run all tests in tests directory
 test_all: test_charclass test_anchor test_anchor_quant_edge test_cleanup simple_anchor_test
 	@echo "Running all tests in tests/ directory..."

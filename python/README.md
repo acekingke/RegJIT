@@ -9,3 +9,12 @@ Build:
 
   make libregjit.so
   make python-bindings
+
+Usage:
+
+  python3.12 -c "import sys; sys.path.insert(0, 'python'); from _regjit import Regex; r=Regex('ab*c'); print(r.match('abbc'))"
+
+Tests:
+
+  # run the basic test
+  python3.12 python/tests/test_bindings.py
