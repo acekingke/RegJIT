@@ -4,11 +4,13 @@
 *.dylib
 *.so
 
-# Test executables
-test_*
+# Test executables (no extension, in project root)
+/test_*
+!/tests/*.cpp
 debug*
 final_test
 simple_test
+simple_anchor_test
 sample
 bench
 
