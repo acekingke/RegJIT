@@ -91,20 +91,14 @@ test_wrong: tests/test_wrong.cpp $(REGJIT_OBJ)
 	$(CXX) -DREGJIT_DEBUG $(CXXFLAGS) -I./src -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
 # Run all tests in tests directory
-test_all: test_charclass test_anchor test_anchor_quant_edge test_cleanup simple_anchor_test
+test_all: test_charclass test_anchor test_quantifier test_anchor_quant_edge test_cleanup simple_anchor_test
 	@echo "Running all tests in tests/ directory..."
 	@if [ -f test_charclass ]; then echo "=== Running test_charclass ==="; ./test_charclass || echo "test_charclass failed"; fi
 	@if [ -f test_anchor ]; then echo "=== Running test_anchor ==="; timeout 3 ./test_anchor || echo "test_anchor failed or timed out"; fi
+	@if [ -f test_quantifier ]; then echo "=== Running test_quantifier ==="; timeout 15 ./test_quantifier || echo "test_quantifier failed or timed out"; fi
 	@if [ -f test_anchor_quant_edge ]; then echo "=== Running test_anchor_quant_edge ==="; timeout 3 ./test_anchor_quant_edge || echo "test_anchor_quant_edge failed or timed out"; fi
 	@if [ -f test_cleanup ]; then echo "=== Running test_cleanup ==="; ./test_cleanup || echo "test_cleanup failed"; fi
-	
-	@if [ -f test_charclass_only ]; then echo "=== Running test_charclass_only ==="; ./test_charclass_only || echo "test_charclass_only failed"; fi
-	@if [ -f test_simple_charclass ]; then echo "=== Running test_simple_charclass ==="; ./test_simple_charclass || echo "test_simple_charclass failed"; fi
-	@if [ -f debug ]; then echo "=== Running debug ==="; ./debug || echo "debug failed"; fi
 	@if [ -f simple_anchor_test ]; then echo "=== Running simple_anchor_test ==="; ./simple_anchor_test || echo "simple_anchor_test failed"; fi
-	
-	@if [ -f final_test ]; then echo "=== Running final_test ==="; ./final_test || echo "final_test failed"; fi
-	@if [ -f simple_test ]; then echo "=== Running simple_test ==="; ./simple_test || echo "simple_test failed"; fi
 	@echo "All tests completed!"
 
 bench: src/benchmark.cpp src/regjit.o
@@ -120,13 +114,14 @@ clean:
 
 # Clean only compiled test executables, keep source files
 clean_tests:
-	 rm -f test_charclass test_anchor test_anchor_quant_edge test_cleanup test_charclass_only test_simple_charclass debug simple_anchor_test simple_test final_test
+	rm -f test_charclass test_anchor test_quantifier test_anchor_quant_edge test_cleanup test_charclass_only test_simple_charclass debug simple_anchor_test simple_test final_test
 
 # Quick test - run only main functionality tests
-test_quick: test_anchor test_charclass
+test_quick: test_anchor test_charclass test_quantifier
 	@echo "Running quick tests (main functionality)..."
 	@if [ -f test_anchor ]; then echo "=== Running test_anchor ==="; timeout 3 ./test_anchor || echo "test_anchor failed or timed out"; fi
 	@if [ -f test_charclass ]; then echo "=== Running test_charclass ==="; ./test_charclass || echo "test_charclass failed"; fi
+	@if [ -f test_quantifier ]; then echo "=== Running test_quantifier ==="; timeout 15 ./test_quantifier || echo "test_quantifier failed or timed out"; fi
 	@echo "Quick tests completed!"
 
 # Help target
