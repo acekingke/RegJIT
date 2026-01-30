@@ -1006,6 +1006,13 @@ public:
         BACKSLASH, // \\ (escape sequence start)
         WORD_BOUNDARY,    // \\b
         NON_WORD_BOUNDARY, // \\B
+        // Character class escapes
+        DIGIT_CLASS,      // \\d - [0-9]
+        NON_DIGIT_CLASS,  // \\D - [^0-9]
+        WORD_CLASS,       // \\w - [a-zA-Z0-9_]
+        NON_WORD_CLASS,   // \\W - [^a-zA-Z0-9_]
+        SPACE_CLASS,      // \\s - [ \\t\\n\\r\\f\\v]
+        NON_SPACE_CLASS,  // \\S - [^ \\t\\n\\r\\f\\v]
         EOS      // End of string
     };
 
@@ -1037,9 +1044,24 @@ public:
                     char c = current();
                     if (is_end()) break;
                     next();
-                    // Return special tokens for \b and \B
+                    // Return special tokens for anchors
                     if (c == 'b') return {WORD_BOUNDARY, 'b'};
                     if (c == 'B') return {NON_WORD_BOUNDARY, 'B'};
+                    // Character class escapes
+                    if (c == 'd') return {DIGIT_CLASS, 'd'};
+                    if (c == 'D') return {NON_DIGIT_CLASS, 'D'};
+                    if (c == 'w') return {WORD_CLASS, 'w'};
+                    if (c == 'W') return {NON_WORD_CLASS, 'W'};
+                    if (c == 's') return {SPACE_CLASS, 's'};
+                    if (c == 'S') return {NON_SPACE_CLASS, 'S'};
+                    // Literal escape characters
+                    if (c == 't') return {CHAR, '\t'};
+                    if (c == 'n') return {CHAR, '\n'};
+                    if (c == 'r') return {CHAR, '\r'};
+                    if (c == 'f') return {CHAR, '\f'};
+                    if (c == 'v') return {CHAR, '\v'};
+                    if (c == '0') return {CHAR, '\0'};
+                    // Any other escaped character is literal
                     return {CHAR, c};
                 }
                 default:
@@ -1151,6 +1173,58 @@ class RegexParser {
         } else if (m_cur_token.type == RegexLexer::NON_WORD_BOUNDARY) {
             m_cur_token = m_lexer.get_next_token();
             return std::make_unique<Anchor>(Anchor::NonWordBoundary); // \B
+        } else if (m_cur_token.type == RegexLexer::DIGIT_CLASS) {
+            // \d - [0-9]
+            m_cur_token = m_lexer.get_next_token();
+            auto cc = std::make_unique<CharClass>(false, false);
+            cc->addRange('0', '9');
+            return cc;
+        } else if (m_cur_token.type == RegexLexer::NON_DIGIT_CLASS) {
+            // \D - [^0-9]
+            m_cur_token = m_lexer.get_next_token();
+            auto cc = std::make_unique<CharClass>(true, false); // negated
+            cc->addRange('0', '9');
+            return cc;
+        } else if (m_cur_token.type == RegexLexer::WORD_CLASS) {
+            // \w - [a-zA-Z0-9_]
+            m_cur_token = m_lexer.get_next_token();
+            auto cc = std::make_unique<CharClass>(false, false);
+            cc->addRange('a', 'z');
+            cc->addRange('A', 'Z');
+            cc->addRange('0', '9');
+            cc->addChar('_');
+            return cc;
+        } else if (m_cur_token.type == RegexLexer::NON_WORD_CLASS) {
+            // \W - [^a-zA-Z0-9_]
+            m_cur_token = m_lexer.get_next_token();
+            auto cc = std::make_unique<CharClass>(true, false); // negated
+            cc->addRange('a', 'z');
+            cc->addRange('A', 'Z');
+            cc->addRange('0', '9');
+            cc->addChar('_');
+            return cc;
+        } else if (m_cur_token.type == RegexLexer::SPACE_CLASS) {
+            // \s - [ \t\n\r\f\v]
+            m_cur_token = m_lexer.get_next_token();
+            auto cc = std::make_unique<CharClass>(false, false);
+            cc->addChar(' ');
+            cc->addChar('\t');
+            cc->addChar('\n');
+            cc->addChar('\r');
+            cc->addChar('\f');
+            cc->addChar('\v');
+            return cc;
+        } else if (m_cur_token.type == RegexLexer::NON_SPACE_CLASS) {
+            // \S - [^ \t\n\r\f\v]
+            m_cur_token = m_lexer.get_next_token();
+            auto cc = std::make_unique<CharClass>(true, false); // negated
+            cc->addChar(' ');
+            cc->addChar('\t');
+            cc->addChar('\n');
+            cc->addChar('\r');
+            cc->addChar('\f');
+            cc->addChar('\v');
+            return cc;
         } else if (m_cur_token.type == RegexLexer::CHAR) {
             char c = m_cur_token.value;
             m_cur_token = m_lexer.get_next_token();
@@ -1248,10 +1322,10 @@ class RegexParser {
     std::unique_ptr<Root> parse_concat() {
         auto left = parse_postfix();
     // Continue concatenation while next token can start an element. This
-    // includes CHAR, group '(', dot '.', character class '[' and anchor
-    // tokens (^, $, \b, \B). Previous implementation only checked for
-    // CHAR or LPAREN which caused trailing anchors (like '$') to be left
-    // unconsumed and dropped from the AST.
+    // includes CHAR, group '(', dot '.', character class '[', anchor
+    // tokens (^, $, \b, \B), and escape class tokens (\d, \D, \w, \W, \s, \S).
+    // Previous implementation only checked for CHAR or LPAREN which caused
+    // trailing anchors (like '$') to be left unconsumed and dropped from AST.
     while (m_cur_token.type == RegexLexer::CHAR ||
            m_cur_token.type == RegexLexer::LPAREN ||
            m_cur_token.type == RegexLexer::DOT ||
@@ -1259,7 +1333,14 @@ class RegexParser {
            m_cur_token.type == RegexLexer::CARET ||
            m_cur_token.type == RegexLexer::DOLLAR ||
            m_cur_token.type == RegexLexer::WORD_BOUNDARY ||
-           m_cur_token.type == RegexLexer::NON_WORD_BOUNDARY) {
+           m_cur_token.type == RegexLexer::NON_WORD_BOUNDARY ||
+           // Escape sequence character classes
+           m_cur_token.type == RegexLexer::DIGIT_CLASS ||
+           m_cur_token.type == RegexLexer::NON_DIGIT_CLASS ||
+           m_cur_token.type == RegexLexer::WORD_CLASS ||
+           m_cur_token.type == RegexLexer::NON_WORD_CLASS ||
+           m_cur_token.type == RegexLexer::SPACE_CLASS ||
+           m_cur_token.type == RegexLexer::NON_SPACE_CLASS) {
             auto right = parse_postfix();
             auto concat = std::make_unique<Concat>();
             concat->Append(std::move(left));
@@ -1293,14 +1374,26 @@ public:
 
 // CharClass implementation
 Value* CharClass::CodeGen() {
-    // Load current character from input
+    // Load current index
     Value* curIdx = Builder.CreateLoad(Builder.getInt32Ty(), Index);
+    
+    // CRITICAL: Boundary check - must have at least one character remaining
+    // Without this, negated classes like \D would match '\0' at string end
+    Value* strLen = Builder.CreateLoad(Builder.getInt32Ty(), StrLenAlloca);
+    Value* inBounds = Builder.CreateICmpSLT(curIdx, strLen);
+    
+    BasicBlock* checkCharBlock = BasicBlock::Create(Context, "charclass_check", MatchF);
+    BasicBlock* matchBlock = BasicBlock::Create(Context, "charclass_match", MatchF);
+    BasicBlock* nomatchBlock = BasicBlock::Create(Context, "charclass_nomatch", MatchF);
+    
+    // If out of bounds, go directly to fail block
+    Builder.CreateCondBr(inBounds, checkCharBlock, nomatchBlock);
+    
+    // Now we're in bounds, load and check the character
+    Builder.SetInsertPoint(checkCharBlock);
     Value* charPtr = Builder.CreateGEP(Builder.getInt8Ty(), Arg0, curIdx);
     Value* currentChar = Builder.CreateLoad(Builder.getInt8Ty(), charPtr);
     currentChar = Builder.CreateIntCast(currentChar, Builder.getInt32Ty(), false);
-    
-    BasicBlock* matchBlock = BasicBlock::Create(Context, "charclass_match", MatchF);
-    BasicBlock* nomatchBlock = BasicBlock::Create(Context, "charclass_nomatch", MatchF);
     
     Value* finalMatch = nullptr;
     

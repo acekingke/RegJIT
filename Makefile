@@ -60,6 +60,9 @@ test_anchor: tests/test_anchor.cpp $(REGJIT_OBJ)
 test_quantifier: tests/test_quantifier.cpp $(REGJIT_OBJ)
 	$(CXX) $(CXXFLAGS) -I./src -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
+test_escape: tests/test_escape.cpp $(REGJIT_OBJ)
+	$(CXX) $(CXXFLAGS) -I./src -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
 simple_anchor_test: tests/simple_anchor_test.cpp $(REGJIT_OBJ)
 	$(CXX) $(CXXFLAGS) -I./src -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
@@ -91,11 +94,12 @@ test_wrong: tests/test_wrong.cpp $(REGJIT_OBJ)
 	$(CXX) -DREGJIT_DEBUG $(CXXFLAGS) -I./src -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
 # Run all tests in tests directory
-test_all: test_charclass test_anchor test_quantifier test_anchor_quant_edge test_cleanup simple_anchor_test
+test_all: test_charclass test_anchor test_quantifier test_escape test_anchor_quant_edge test_cleanup simple_anchor_test
 	@echo "Running all tests in tests/ directory..."
 	@if [ -f test_charclass ]; then echo "=== Running test_charclass ==="; ./test_charclass || echo "test_charclass failed"; fi
 	@if [ -f test_anchor ]; then echo "=== Running test_anchor ==="; timeout 3 ./test_anchor || echo "test_anchor failed or timed out"; fi
 	@if [ -f test_quantifier ]; then echo "=== Running test_quantifier ==="; timeout 15 ./test_quantifier || echo "test_quantifier failed or timed out"; fi
+	@if [ -f test_escape ]; then echo "=== Running test_escape ==="; timeout 15 ./test_escape || echo "test_escape failed or timed out"; fi
 	@if [ -f test_anchor_quant_edge ]; then echo "=== Running test_anchor_quant_edge ==="; timeout 3 ./test_anchor_quant_edge || echo "test_anchor_quant_edge failed or timed out"; fi
 	@if [ -f test_cleanup ]; then echo "=== Running test_cleanup ==="; ./test_cleanup || echo "test_cleanup failed"; fi
 	@if [ -f simple_anchor_test ]; then echo "=== Running simple_anchor_test ==="; ./simple_anchor_test || echo "simple_anchor_test failed"; fi
