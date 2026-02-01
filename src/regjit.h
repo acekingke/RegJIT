@@ -81,6 +81,11 @@ public:
     // Returns the first literal character if the pattern starts with a literal
     // Returns -1 if not applicable (e.g., starts with anchor, char class, etc.)
     virtual int getFirstLiteralChar() const { return -1; }
+    // Returns the literal prefix string (consecutive literal characters at start)
+    // Returns empty string if pattern doesn't start with literals
+    virtual std::string getLiteralPrefix() const { return ""; }
+    // Returns true if this node is a pure literal (only Match nodes, no special chars)
+    virtual bool isPureLiteral() const { return false; }
     void SetFailBlock(BasicBlock *b) {
       failBlock = b;
     }
@@ -108,9 +113,11 @@ public:
 
     public:
      explicit Match(char x) :choice(x){}
-      
+     char getChar() const { return choice; }
      Value* CodeGen() override;
      int getFirstLiteralChar() const override { return static_cast<unsigned char>(choice); }
+     std::string getLiteralPrefix() const override { return std::string(1, choice); }
+     bool isPureLiteral() const override { return true; }
       ~Match() override = default; 
   };
   class Concat: public Root{
@@ -128,6 +135,22 @@ public:
         return child->getFirstLiteralChar();
       }
       return -1;
+    }
+    std::string getLiteralPrefix() const override {
+      std::string result;
+      for (const auto& child : BodyVec) {
+        if (child->isZeroWidth()) continue;  // skip anchors
+        if (!child->isPureLiteral()) break;  // stop at non-literal
+        result += child->getLiteralPrefix();
+      }
+      return result;
+    }
+    bool isPureLiteral() const override {
+      for (const auto& child : BodyVec) {
+        if (child->isZeroWidth()) continue;
+        if (!child->isPureLiteral()) return false;
+      }
+      return true;
     }
   };
   

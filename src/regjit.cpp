@@ -617,18 +617,46 @@ Value* Func::CodeGen() {
         Builder.SetInsertPoint(PostStrlenBB);
         Value* strlenVal = Builder.CreateLoad(Builder.getInt32Ty(), StrLenAlloca);
 
-        // Check if we can use memchr optimization for literal prefix
+        // Check optimization opportunities
+        std::string literalPrefix = Body->getLiteralPrefix();
+        bool isPureLiteral = Body->isPureLiteral();
         int firstLiteralChar = Body->getFirstLiteralChar();
-        bool useMemchrOpt = (firstLiteralChar >= 0);
+        
+        Type* i8ptrTy = PointerType::get(Builder.getInt8Ty(), 0);
+        Type* sizeTy = Builder.getInt64Ty();
 
-        if (useMemchrOpt) {
+        if (isPureLiteral && literalPrefix.length() > 0) {
+            // === MEMMEM OPTIMIZATION PATH ===
+            // For pure literal patterns, use memmem to find the entire string at once
+            // This is the fastest path - O(n) with good constants
+            
+            RJDBG(std::cerr << "Using memmem optimization for literal: " << literalPrefix << "\n");
+            
+            // Declare memmem: void* memmem(const void* haystack, size_t haystacklen,
+            //                              const void* needle, size_t needlelen)
+            FunctionCallee memmemFn = ThisModule->getOrInsertFunction("memmem",
+                FunctionType::get(i8ptrTy, {i8ptrTy, sizeTy, i8ptrTy, sizeTy}, false));
+            
+            // Create a global string constant for the needle
+            Value* needlePtr = Builder.CreateGlobalStringPtr(literalPrefix, "needle");
+            Value* needleLen = ConstantInt::get(sizeTy, literalPrefix.length());
+            
+            // Call memmem(Arg0, strlen, needle, needlelen)
+            Value* haystackLen = Builder.CreateZExt(strlenVal, sizeTy);
+            Value* foundPtr = Builder.CreateCall(memmemFn, {Arg0, haystackLen, needlePtr, needleLen});
+            
+            // Check if memmem found anything
+            Value* isNull = Builder.CreateICmpEQ(foundPtr, ConstantPointerNull::get(cast<PointerType>(i8ptrTy)));
+            Builder.CreateCondBr(isNull, ReturnFailBB, ReturnSuccessBB);
+            
+        } else if (firstLiteralChar >= 0) {
             // === MEMCHR OPTIMIZATION PATH ===
             // Use memchr to quickly find the next occurrence of the first literal character
             // instead of checking every position sequentially.
             
+            RJDBG(std::cerr << "Using memchr optimization for first char: " << (char)firstLiteralChar << "\n");
+            
             // Declare memchr: void* memchr(const void* s, int c, size_t n)
-            Type* i8ptrTy = PointerType::get(Builder.getInt8Ty(), 0);
-            Type* sizeTy = Builder.getInt64Ty();
             FunctionCallee memchrFn = ThisModule->getOrInsertFunction("memchr",
                 FunctionType::get(i8ptrTy, {i8ptrTy, Builder.getInt32Ty(), sizeTy}, false));
             
