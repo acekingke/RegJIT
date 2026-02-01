@@ -1,5 +1,6 @@
 #pragma once
 #include <memory>
+#include <set>
 #include <llvm/ADT/APInt.h>
 #include <llvm/ExecutionEngine/Orc/ExecutionUtils.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
@@ -89,6 +90,9 @@ public:
     // Returns the single character if this is a simple Match node, -1 otherwise
     // Used for optimizing patterns like a+, b*, etc.
     virtual int getSingleChar() const { return -1; }
+    // Returns characters that MUST appear in any successful match
+    // Used for pre-filtering optimization - quickly reject strings missing required chars
+    virtual std::set<char> getRequiredChars() const { return {}; }
     void SetFailBlock(BasicBlock *b) {
       failBlock = b;
     }
@@ -122,6 +126,7 @@ public:
      std::string getLiteralPrefix() const override { return std::string(1, choice); }
      bool isPureLiteral() const override { return true; }
      int getSingleChar() const override { return static_cast<unsigned char>(choice); }
+     std::set<char> getRequiredChars() const override { return {choice}; }
       ~Match() override = default; 
   };
   class Concat: public Root{
@@ -156,6 +161,14 @@ public:
       }
       return true;
     }
+    std::set<char> getRequiredChars() const override {
+      std::set<char> result;
+      for (const auto& child : BodyVec) {
+        auto childChars = child->getRequiredChars();
+        result.insert(childChars.begin(), childChars.end());
+      }
+      return result;
+    }
   };
   
   class Alternative: public Root{
@@ -166,6 +179,20 @@ public:
     Value* CodeGen() override;
     bool isAnchoredAtStart() const override;
     bool containsZeroWidthRepeat() const override;
+    std::set<char> getRequiredChars() const override {
+      // For alternatives, only chars required by ALL branches are truly required
+      if (BodyVec.empty()) return {};
+      std::set<char> result = BodyVec[0]->getRequiredChars();
+      for (size_t i = 1; i < BodyVec.size(); ++i) {
+        auto branchChars = BodyVec[i]->getRequiredChars();
+        std::set<char> intersection;
+        for (char c : result) {
+          if (branchChars.count(c)) intersection.insert(c);
+        }
+        result = std::move(intersection);
+      }
+      return result;
+    }
   };
   // not operator
   class Not: public Root {
@@ -205,6 +232,12 @@ public:
     // Repeats are not considered anchored at start conservatively because
     // a repeat may wrap a zero-width anchor and change search semantics.
     bool isAnchoredAtStart() const override { return false; }
+    std::set<char> getRequiredChars() const override {
+      // If min is 0 (e.g., * or ?), the repeat is optional, so no chars required
+      if (minCount == 0) return {};
+      // If min > 0, the body's required chars are also required
+      return Body->getRequiredChars();
+    }
   };
 
 

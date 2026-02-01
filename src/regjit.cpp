@@ -843,45 +843,145 @@ Value* Func::CodeGen() {
             Builder.CreateBr(MemchrSearchBB);
             
         } else {
-            // === STANDARD SEARCH LOOP (no optimization) ===
-            BasicBlock *LoopCheckBB = BasicBlock::Create(Context, "search_loop_check", MatchF);
-            BasicBlock *LoopBodyBB = BasicBlock::Create(Context, "search_loop_body", MatchF);
-            BasicBlock *LoopIncBB = BasicBlock::Create(Context, "search_loop_inc", MatchF);
-
-            Builder.CreateBr(LoopCheckBB);
-
-            // Search loop condition: for(curIdx=0; curIdx<=strlen; ++curIdx)
-            Builder.SetInsertPoint(LoopCheckBB);
-            Value *curIdx_search = Builder.CreateLoad(Builder.getInt32Ty(), Index);
-            Value *cond = Builder.CreateICmpSLE(curIdx_search, strlenVal);
-            Builder.CreateCondBr(cond, LoopBodyBB, ReturnFailBB);
-
-            // Each search attempt gets its own AST success/fail blocks
-            Builder.SetInsertPoint(LoopBodyBB);
-            BasicBlock *TrySuccess = BasicBlock::Create(Context, "try_success", MatchF);
-            BasicBlock *TryFail = BasicBlock::Create(Context, "try_fail", MatchF);
+            // === STANDARD SEARCH LOOP ===
             
-            // Before calling CodeGen on the body, we must reset the index for each
-            // attempt in the search loop. The index is stored in the 'Index' alloca.
-            Builder.CreateStore(curIdx_search, Index);
+            // Check if pattern has required characters for memchr-accelerated search
+            std::set<char> requiredChars = Body->getRequiredChars();
+            
+            if (!requiredChars.empty()) {
+                // === MEMCHR-ACCELERATED SEARCH LOOP ===
+                // Use memchr to find positions where required char exists,
+                // then limit search to only those candidate regions
+                char filterChar = *requiredChars.begin();
+                RJDBG(std::cerr << "Using memchr-accelerated search for required char: '" << filterChar << "'\n");
+                
+                // Declare memchr
+                FunctionCallee memchrFn = ThisModule->getOrInsertFunction("memchr",
+                    FunctionType::get(i8ptrTy, {i8ptrTy, Builder.getInt32Ty(), sizeTy}, false));
+                Value* filterCharVal = ConstantInt::get(Builder.getInt32Ty(), static_cast<unsigned char>(filterChar));
+                
+                // Create blocks for the accelerated search
+                BasicBlock *MemchrSearchBB = BasicBlock::Create(Context, "memchr_search", MatchF);
+                BasicBlock *MemchrFoundBB = BasicBlock::Create(Context, "memchr_found", MatchF);
+                BasicBlock *RangeLoopCheckBB = BasicBlock::Create(Context, "range_loop_check", MatchF);
+                BasicBlock *RangeLoopBodyBB = BasicBlock::Create(Context, "range_loop_body", MatchF);
+                BasicBlock *NextMemchrBB = BasicBlock::Create(Context, "next_memchr", MatchF);
+                
+                // Store the "range end" - we'll search positions 0..foundPos for each memchr hit
+                AllocaInst* RangeEndAlloca = Builder.CreateAlloca(Builder.getInt32Ty(), nullptr, "range_end");
+                AllocaInst* RangeStartAlloca = Builder.CreateAlloca(Builder.getInt32Ty(), nullptr, "range_start");
+                AllocaInst* MemchrPosAlloca = Builder.CreateAlloca(Builder.getInt32Ty(), nullptr, "memchr_pos");
+                
+                // Initialize: first memchr search starts at position 0
+                Builder.CreateStore(ConstantInt::get(Builder.getInt32Ty(), 0), RangeStartAlloca);
+                Builder.CreateStore(ConstantInt::get(Builder.getInt32Ty(), 0), MemchrPosAlloca);
+                Builder.CreateBr(MemchrSearchBB);
+                
+                // === MEMCHR SEARCH BLOCK ===
+                // Find next occurrence of required char
+                Builder.SetInsertPoint(MemchrSearchBB);
+                Value* memchrStartPos = Builder.CreateLoad(Builder.getInt32Ty(), MemchrPosAlloca);
+                Value* searchPtr = Builder.CreateGEP(Builder.getInt8Ty(), Arg0, {memchrStartPos});
+                Value* remaining = Builder.CreateSub(strlenVal, memchrStartPos);
+                Value* remainingSize = Builder.CreateZExt(remaining, sizeTy);
+                
+                Value* foundPtr = Builder.CreateCall(memchrFn, {searchPtr, filterCharVal, remainingSize});
+                Value* isNull = Builder.CreateICmpEQ(foundPtr, ConstantPointerNull::get(cast<PointerType>(i8ptrTy)));
+                Builder.CreateCondBr(isNull, ReturnFailBB, MemchrFoundBB);
+                
+                // === MEMCHR FOUND BLOCK ===
+                // Calculate position of found char
+                Builder.SetInsertPoint(MemchrFoundBB);
+                Value* foundPtrInt = Builder.CreatePtrToInt(foundPtr, sizeTy);
+                Value* arg0PtrInt = Builder.CreatePtrToInt(Arg0, sizeTy);
+                Value* foundPosLong = Builder.CreateSub(foundPtrInt, arg0PtrInt);
+                Value* foundPos = Builder.CreateTrunc(foundPosLong, Builder.getInt32Ty());
+                
+                // Set range: try positions from RangeStart to foundPos (inclusive)
+                Value* rangeStart = Builder.CreateLoad(Builder.getInt32Ty(), RangeStartAlloca);
+                Builder.CreateStore(foundPos, RangeEndAlloca);
+                Builder.CreateStore(rangeStart, Index);  // Start trying from rangeStart
+                Builder.CreateBr(RangeLoopCheckBB);
+                
+                // === RANGE LOOP CHECK ===
+                // Check if we've tried all positions in the range
+                Builder.SetInsertPoint(RangeLoopCheckBB);
+                Value* curIdx = Builder.CreateLoad(Builder.getInt32Ty(), Index);
+                Value* rangeEnd = Builder.CreateLoad(Builder.getInt32Ty(), RangeEndAlloca);
+                Value* inRange = Builder.CreateICmpSLE(curIdx, rangeEnd);
+                Builder.CreateCondBr(inRange, RangeLoopBodyBB, NextMemchrBB);
+                
+                // === RANGE LOOP BODY ===
+                // Try to match at current position
+                Builder.SetInsertPoint(RangeLoopBodyBB);
+                BasicBlock *TrySuccess = BasicBlock::Create(Context, "try_success", MatchF);
+                BasicBlock *TryFail = BasicBlock::Create(Context, "try_fail", MatchF);
+                
+                Value* tryIdx = Builder.CreateLoad(Builder.getInt32Ty(), Index);
+                Builder.CreateStore(tryIdx, Index);
+                
+                Body->SetFailBlock(TryFail);
+                Body->SetSuccessBlock(TrySuccess);
+                Body->CodeGen();
+                
+                // Success - return 1
+                Builder.SetInsertPoint(TrySuccess);
+                Builder.CreateBr(ReturnSuccessBB);
+                
+                // Fail - try next position in range
+                Builder.SetInsertPoint(TryFail);
+                Value* nextIdx = Builder.CreateAdd(tryIdx, ConstantInt::get(Builder.getInt32Ty(), 1));
+                Builder.CreateStore(nextIdx, Index);
+                Builder.CreateBr(RangeLoopCheckBB);
+                
+                // === NEXT MEMCHR ===
+                // Move to find next occurrence of required char
+                Builder.SetInsertPoint(NextMemchrBB);
+                Value* nextRangeEnd = Builder.CreateLoad(Builder.getInt32Ty(), RangeEndAlloca);
+                Value* nextMemchrPos = Builder.CreateAdd(nextRangeEnd, ConstantInt::get(Builder.getInt32Ty(), 1));
+                Builder.CreateStore(nextMemchrPos, MemchrPosAlloca);
+                Builder.CreateStore(nextMemchrPos, RangeStartAlloca);  // Next range starts after this one
+                Builder.CreateBr(MemchrSearchBB);
+                
+            } else {
+                // === BASIC SEARCH LOOP (no required chars to accelerate) ===
+                BasicBlock *LoopCheckBB = BasicBlock::Create(Context, "search_loop_check", MatchF);
+                BasicBlock *LoopBodyBB = BasicBlock::Create(Context, "search_loop_body", MatchF);
+                BasicBlock *LoopIncBB = BasicBlock::Create(Context, "search_loop_inc", MatchF);
 
-            Body->SetFailBlock(TryFail);
-            Body->SetSuccessBlock(TrySuccess);
-            Body->CodeGen();
+                Builder.CreateBr(LoopCheckBB);
 
-            // If body succeeds, return success immediately
-            Builder.SetInsertPoint(TrySuccess);
-            Builder.CreateBr(ReturnSuccessBB);
+                // Search loop condition: for(curIdx=0; curIdx<=strlen; ++curIdx)
+                Builder.SetInsertPoint(LoopCheckBB);
+                Value *curIdx_search = Builder.CreateLoad(Builder.getInt32Ty(), Index);
+                Value *cond = Builder.CreateICmpSLE(curIdx_search, strlenVal);
+                Builder.CreateCondBr(cond, LoopBodyBB, ReturnFailBB);
 
-            // If body fails, go to increment and try next index
-            Builder.SetInsertPoint(TryFail);
-            Builder.CreateBr(LoopIncBB);
+                // Each search attempt gets its own AST success/fail blocks
+                Builder.SetInsertPoint(LoopBodyBB);
+                BasicBlock *TrySuccess = BasicBlock::Create(Context, "try_success", MatchF);
+                BasicBlock *TryFail = BasicBlock::Create(Context, "try_fail", MatchF);
+                
+                Builder.CreateStore(curIdx_search, Index);
 
-            // Search loop increment: curIdx++ and loop back
-            Builder.SetInsertPoint(LoopIncBB);
-            Value* nextIdx_search = Builder.CreateAdd(curIdx_search, ConstantInt::get(Context, APInt(32, 1)));
-            Builder.CreateStore(nextIdx_search, Index);
-            Builder.CreateBr(LoopCheckBB);
+                Body->SetFailBlock(TryFail);
+                Body->SetSuccessBlock(TrySuccess);
+                Body->CodeGen();
+
+                // If body succeeds, return success immediately
+                Builder.SetInsertPoint(TrySuccess);
+                Builder.CreateBr(ReturnSuccessBB);
+
+                // If body fails, go to increment and try next index
+                Builder.SetInsertPoint(TryFail);
+                Builder.CreateBr(LoopIncBB);
+
+                // Search loop increment: curIdx++ and loop back
+                Builder.SetInsertPoint(LoopIncBB);
+                Value* nextIdx_search = Builder.CreateAdd(curIdx_search, ConstantInt::get(Context, APInt(32, 1)));
+                Builder.CreateStore(nextIdx_search, Index);
+                Builder.CreateBr(LoopCheckBB);
+            }
         }
     }
 
