@@ -133,7 +133,7 @@ test_all: test_charclass test_anchor test_quantifier test_escape test_anchor_qua
 	@echo "All tests completed!"
 
 bench: src/benchmark.cpp src/regjit.o
-	$(CXX) $(CXXFLAGS) -o $@ $^  $(LDFLAGS) $(LDLIBS) 
+	$(CXX) $(CXXFLAGS) $(shell pkg-config --cflags libpcre2-8) -o $@ $^ $(LDFLAGS) $(LDLIBS) $(shell pkg-config --libs libpcre2-8) 
 
 sample: src/sample.cpp src/regjit.o
 	$(CXX) $(CXXFLAGS) -o $@ $^  $(LDFLAGS) $(LDLIBS) 

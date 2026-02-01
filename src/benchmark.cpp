@@ -6,6 +6,10 @@
 #include <string>
 #include <iomanip>
 
+// PCRE2 support
+#define PCRE2_CODE_UNIT_WIDTH 8
+#include <pcre2.h>
+
 // Benchmark result structure
 struct BenchResult {
     std::string name;
@@ -13,12 +17,56 @@ struct BenchResult {
     std::string input;
     uint64_t jit_ns;
     uint64_t std_ns;
-    double speedup;
+    uint64_t pcre2_ns;
+    double speedup_vs_std;
+    double speedup_vs_pcre2;
 };
 
 // Number of iterations for each benchmark
 constexpr int ITERATIONS = 100000;
 constexpr int WARMUP = 1000;
+
+// Benchmark PCRE2 regex
+uint64_t benchmark_pcre2(const std::string& pattern, const std::string& input) {
+    int errornumber;
+    PCRE2_SIZE erroroffset;
+    
+    pcre2_code *re = pcre2_compile(
+        (PCRE2_SPTR)pattern.c_str(),
+        PCRE2_ZERO_TERMINATED,
+        0,
+        &errornumber,
+        &erroroffset,
+        NULL
+    );
+    
+    if (re == NULL) {
+        // Pattern compilation failed
+        return 0;
+    }
+    
+    // JIT compile the pattern for maximum performance
+    pcre2_jit_compile(re, PCRE2_JIT_COMPLETE);
+    
+    pcre2_match_data *match_data = pcre2_match_data_create_from_pattern(re, NULL);
+    
+    // Warmup
+    for (int i = 0; i < WARMUP; ++i) {
+        pcre2_match(re, (PCRE2_SPTR)input.c_str(), input.length(), 0, 0, match_data, NULL);
+    }
+    
+    // Benchmark
+    auto start = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < ITERATIONS; ++i) {
+        pcre2_match(re, (PCRE2_SPTR)input.c_str(), input.length(), 0, 0, match_data, NULL);
+    }
+    auto end = std::chrono::high_resolution_clock::now();
+    
+    pcre2_match_data_free(match_data);
+    pcre2_code_free(re);
+    
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count() / ITERATIONS;
+}
 
 // Benchmark JIT regex
 uint64_t benchmark_jit(const std::string& pattern, const std::string& input) {
@@ -82,52 +130,67 @@ BenchResult run_benchmark(const std::string& name, const std::string& pattern,
     // Use std_pattern if provided (for patterns that differ between JIT and std::regex)
     const std::string& p = std_pattern.empty() ? pattern : std_pattern;
     result.std_ns = benchmark_std_regex(p, input);
+    result.pcre2_ns = benchmark_pcre2(p, input);
     
-    result.speedup = result.jit_ns > 0 ? (double)result.std_ns / result.jit_ns : 0;
+    result.speedup_vs_std = result.jit_ns > 0 ? (double)result.std_ns / result.jit_ns : 0;
+    result.speedup_vs_pcre2 = result.jit_ns > 0 ? (double)result.pcre2_ns / result.jit_ns : 0;
     
     return result;
 }
 
 void print_results(const std::vector<BenchResult>& results) {
     std::cout << "\n";
-    std::cout << std::string(100, '=') << "\n";
-    std::cout << "                           RegJIT vs std::regex Benchmark Results\n";
-    std::cout << std::string(100, '=') << "\n";
-    std::cout << std::left << std::setw(25) << "Test Case"
-              << std::setw(20) << "Pattern"
-              << std::right << std::setw(12) << "JIT (ns)"
-              << std::setw(15) << "std::regex"
-              << std::setw(12) << "Speedup"
+    std::cout << std::string(120, '=') << "\n";
+    std::cout << "                         RegJIT vs std::regex vs PCRE2 (JIT) Benchmark Results\n";
+    std::cout << std::string(120, '=') << "\n";
+    std::cout << std::left << std::setw(22) << "Test Case"
+              << std::setw(18) << "Pattern"
+              << std::right << std::setw(12) << "RegJIT(ns)"
+              << std::setw(14) << "std::regex"
+              << std::setw(14) << "PCRE2-JIT"
+              << std::setw(14) << "vs std"
+              << std::setw(14) << "vs PCRE2"
               << "\n";
-    std::cout << std::string(100, '-') << "\n";
+    std::cout << std::string(120, '-') << "\n";
     
-    double total_speedup = 0;
+    double total_speedup_std = 0;
+    double total_speedup_pcre2 = 0;
     int count = 0;
     
     for (const auto& r : results) {
-        std::cout << std::left << std::setw(25) << r.name
-                  << std::setw(20) << r.pattern
+        std::cout << std::left << std::setw(22) << r.name
+                  << std::setw(18) << (r.pattern.length() > 16 ? r.pattern.substr(0, 13) + "..." : r.pattern)
                   << std::right << std::setw(12) << r.jit_ns
-                  << std::setw(15) << r.std_ns
-                  << std::setw(10) << std::fixed << std::setprecision(1) << r.speedup << "x"
+                  << std::setw(14) << r.std_ns
+                  << std::setw(14) << r.pcre2_ns
+                  << std::setw(12) << std::fixed << std::setprecision(2) << r.speedup_vs_std << "x"
+                  << std::setw(12) << std::fixed << std::setprecision(2) << r.speedup_vs_pcre2 << "x"
                   << "\n";
-        if (r.speedup > 0) {
-            total_speedup += r.speedup;
+        if (r.speedup_vs_std > 0) {
+            total_speedup_std += r.speedup_vs_std;
+            total_speedup_pcre2 += r.speedup_vs_pcre2;
             count++;
         }
     }
     
-    std::cout << std::string(100, '-') << "\n";
-    std::cout << std::left << std::setw(25) << "Average Speedup:"
-              << std::right << std::setw(67) << std::fixed << std::setprecision(1) 
-              << (count > 0 ? total_speedup / count : 0) << "x\n";
-    std::cout << std::string(100, '=') << "\n";
+    std::cout << std::string(120, '-') << "\n";
+    std::cout << std::left << std::setw(22) << "Average Speedup:"
+              << std::setw(18) << ""
+              << std::right << std::setw(12) << ""
+              << std::setw(14) << ""
+              << std::setw(14) << ""
+              << std::setw(12) << std::fixed << std::setprecision(2) 
+              << (count > 0 ? total_speedup_std / count : 0) << "x"
+              << std::setw(12) << std::fixed << std::setprecision(2) 
+              << (count > 0 ? total_speedup_pcre2 / count : 0) << "x"
+              << "\n";
+    std::cout << std::string(120, '=') << "\n";
 }
 
 int main() {
     std::vector<BenchResult> results;
     
-    std::cout << "Running RegJIT vs std::regex benchmarks...\n";
+    std::cout << "Running RegJIT vs std::regex vs PCRE2 (JIT) benchmarks...\n";
     std::cout << "Iterations per test: " << ITERATIONS << "\n";
     
     // ========== Basic Character Matching ==========
