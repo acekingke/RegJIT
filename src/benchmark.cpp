@@ -23,8 +23,9 @@ struct BenchResult {
 };
 
 // Number of iterations for each benchmark
-constexpr int ITERATIONS = 100000;
-constexpr int WARMUP = 1000;
+// Note: 10K iterations provides good accuracy while keeping runtime reasonable
+constexpr int ITERATIONS = 10000;
+constexpr int WARMUP = 100;
 
 // Benchmark PCRE2 regex
 uint64_t benchmark_pcre2(const std::string& pattern, const std::string& input) {
