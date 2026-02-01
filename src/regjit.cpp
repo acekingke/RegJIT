@@ -82,7 +82,7 @@ void Initialize() {
 // Runtime trace helper called from generated code. Keep C linkage so the
 // JIT can resolve the symbol via DynamicLibrarySearchGenerator.
 extern "C" void regjit_trace(const char* tag, int idx, int cnt) {
-    fprintf(stderr, "regjit_trace: %s idx=%d cnt=%d\n", tag, idx, cnt);
+    RJDBG(fprintf(stderr, "regjit_trace: %s idx=%d cnt=%d\n", tag, idx, cnt));
 }
 
 // NOTE: previous attempts to defensively create new blocks when the current
@@ -168,7 +168,7 @@ CompiledEntry getOrCompile(const std::string &pattern) {
       std::hash<std::string> hasher;
       auto h = hasher(pattern);
       FunctionName = "regjit_match_" + std::to_string(h) + "_" + std::to_string(id);
-      fprintf(stderr, "getOrCompile: compiling pattern='%s' -> FunctionName='%s'\n", pattern.c_str(), FunctionName.c_str());
+      RJDBG(fprintf(stderr, "getOrCompile: compiling pattern='%s' -> FunctionName='%s'\n", pattern.c_str(), FunctionName.c_str()));
 
       // create fresh per-compile LLVMContext and IRBuilder, and set pointers so
       // CodeGen uses them via the Context/Builder macros
@@ -503,9 +503,7 @@ int Execute(const char* input) {
   // Use the last generated function name if available; fall back to legacy
   // "match" for compatibility with older code paths.
   std::string lookupName = FunctionName.empty() ? "match" : FunctionName;
-  // Print the function lookup info so we can correlate runtime calls with
-  // the IR/module dumps and verify whether naming changes propagated.
-  fprintf(stderr, "Execute(): FunctionName='%s' lookupName='%s'\n", FunctionName.c_str(), lookupName.c_str());
+  RJDBG(fprintf(stderr, "Execute(): FunctionName='%s' lookupName='%s'\n", FunctionName.c_str(), lookupName.c_str()));
   auto MatchSym = ExitOnErr(JIT->lookup(lookupName));
   auto Func = (int (*)(const char*))MatchSym.getValue();
 

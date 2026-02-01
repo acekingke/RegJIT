@@ -3,9 +3,18 @@
 #        make REGJIT_DEBUG=1 src/regjit.o
 REGJIT_DEBUG ?= 0
 
-DEBUG_FLAGS := -g -O0
+# Release mode: set RELEASE=1 for optimized builds (recommended for benchmarks)
+# Usage: make RELEASE=1 bench
+RELEASE ?= 0
+
+ifeq ($(RELEASE),1)
+BUILD_FLAGS := -O3 -DNDEBUG
+else
+BUILD_FLAGS := -g -O0
+endif
+
 LLVM_CONFIG := /opt/homebrew/Cellar/llvm/19.1.7_1/bin/llvm-config
-CXXFLAGS := $(DEBUG_FLAGS) -Wall -Wno-unknown-warning-option -std=c++17
+CXXFLAGS := $(BUILD_FLAGS) -Wall -Wno-unknown-warning-option -std=c++17
 CXXFLAGS += $(shell $(LLVM_CONFIG) --cxxflags)
 
 # Add REGJIT_DEBUG flag if enabled
@@ -161,6 +170,10 @@ help:
 	@echo "  sample        - Build sample"
 	@echo "  help          - Show this help"
 	@echo ""
-	@echo "Debug mode:"
+	@echo "Build modes:"
+	@echo "  make RELEASE=1 <target>       - Optimized build (-O3), recommended for benchmarks"
 	@echo "  make REGJIT_DEBUG=1 <target>  - Enable IR dump and diagnostic output"
-	@echo "  Example: make REGJIT_DEBUG=1 test_wrong"
+	@echo ""
+	@echo "Examples:"
+	@echo "  make RELEASE=1 bench          - Build optimized benchmark"
+	@echo "  make REGJIT_DEBUG=1 test_wrong - Build with debug output"
