@@ -1,6 +1,6 @@
 # 🚀 RegJIT - Regular Expression JIT Compiler
 
-A high-performance regex engine that compiles regular expressions to native machine code using LLVM, achieving **up to 1031x speedup** over C++'s `std::regex` and **up to 8.5x speedup** over PCRE2-JIT.
+A high-performance regex engine that compiles regular expressions to native machine code using LLVM, achieving **up to 997x speedup** over C++'s `std::regex` and **up to 11x speedup** over PCRE2-JIT.
 
 ## 📊 Performance Results
 
@@ -8,25 +8,26 @@ Benchmark results comparing RegJIT vs `std::regex` vs PCRE2-JIT (compiled with `
 
 | Test Case | Pattern | RegJIT (ns) | std::regex (ns) | PCRE2-JIT (ns) | vs std | vs PCRE2 |
 |-----------|---------|-------------|-----------------|----------------|--------|----------|
-| Plus quantifier | `a+` | 55 | 56,759 | 346 | **1031x** | **6.3x** |
-| Star quantifier | `a*` | 59 | 56,705 | 317 | **961x** | **5.4x** |
-| Long input (10KB) | `needle` | 434 | 351,682 | 291 | **810x** | 0.67x |
-| Char class | `[a-zA-Z0-9]+` | 3 | 1,935 | 22 | **645x** | **7.3x** |
-| Word chars | `\w+` | 2 | 1,255 | 17 | **628x** | **8.5x** |
-| Digits | `\d+` | 2 | 939 | 15 | **470x** | **7.5x** |
-| Whitespace | `\s+` | 2 | 664 | 14 | **332x** | **7.0x** |
-| Char class | `[a-z]+` | 2 | 442 | 12 | **221x** | **6.0x** |
-| Negated class | `[^0-9]+` | 2 | 416 | 13 | **208x** | **6.5x** |
-| Email pattern | `[a-z]+@[a-z]+\.[a-z]+` | 27 | 5,325 | 23 | **197x** | 0.85x |
-| Alternation | `cat\|dog\|bird` | 8 | 1,534 | 14 | **192x** | **1.8x** |
-| IP pattern | `\d+\.\d+\.\d+\.\d+` | 11 | 2,020 | 24 | **184x** | **2.2x** |
-| Nested groups | `(a(b(c)+)+)+` | 12 | 1,624 | 40 | **135x** | **3.3x** |
-| Exact repeat | `a{1000}` | 87 | 8,296 | 323 | **95x** | **3.7x** |
+| Plus quantifier | `a+` | 56 | 55,820 | 337 | **997x** | **6.0x** |
+| Star quantifier | `a*` | 58 | 57,088 | 313 | **984x** | **5.4x** |
+| Char class | `[a-zA-Z0-9]+` | 2 | 1,957 | 22 | **979x** | **11.0x** |
+| Long input (10KB) | `needle` | 428 | 360,640 | 326 | **843x** | 0.76x |
+| Word chars | `\w+` | 2 | 1,241 | 17 | **621x** | **8.5x** |
+| Digits | `\d+` | 2 | 880 | 15 | **440x** | **7.5x** |
+| Whitespace | `\s+` | 2 | 632 | 15 | **316x** | **7.5x** |
+| Char class | `[a-z]+` | 2 | 452 | 13 | **226x** | **6.5x** |
+| Negated class | `[^0-9]+` | 2 | 424 | 15 | **212x** | **7.5x** |
+| Alternation | `cat\|dog\|bird` | 8 | 1,611 | 15 | **201x** | **1.9x** |
+| Email pattern | `[a-z]+@[a-z]+\.[a-z]+` | 32 | 5,407 | 23 | **169x** | 0.72x |
+| IP pattern | `\d+\.\d+\.\d+\.\d+` | 12 | 1,978 | 24 | **165x** | **2.0x** |
+| Exact repeat | `a{1000}` | 58 | 7,559 | 345 | **130x** | **6.0x** |
+| Nested groups | `(a(b(c)+)+)+` | 15 | 1,653 | 43 | **110x** | **2.9x** |
 
-**Average Speedup: 317x vs std::regex, 3.9x vs PCRE2-JIT**
+**Average Speedup: 331x vs std::regex, 4.3x vs PCRE2-JIT**
 
 ### Key Optimizations
 
+- **memchr-Accelerated Search**: Uses `memchr` to find required characters in patterns (e.g., `@` in email patterns)
 - **Boyer-Moore-Horspool**: Custom string search algorithm (replaces slow macOS `memmem`)
 - **ARM NEON SIMD**: Vectorized character counting for `a+`, `a*`, `a{n}` patterns
 - **Direct Function Pointers**: Embedded libc calls (strlen, memchr) avoid symbol lookup
@@ -157,15 +158,15 @@ Example output:
 ========================================================================================================================
 Test Case             Pattern             RegJIT(ns)    std::regex     PCRE2-JIT        vs std      vs PCRE2
 ------------------------------------------------------------------------------------------------------------------------
-Plus quantifier a+    a+                          55         56759           346       1031.98x        6.29x
-Star quantifier a*    a*                          59         56705           317        961.10x        5.37x
-Long input search     needle                     434        351682           291        810.33x        0.67x
-Char class [a-zA-Z0-9]+[a-zA-Z0-9]+                 3          1935            22        645.00x        7.33x
-Word \w+              \w+                          2          1255            17        627.50x        8.50x
-Digit \d+             \d+                          2           939            15        469.50x        7.50x
+Plus quantifier a+    a+                          56         55820           337        996.79x        6.02x
+Star quantifier a*    a*                          58         57088           313        984.28x        5.40x
+Long input search     needle                     428        360640           326        842.62x        0.76x
+Char class [a-zA-Z0-9]+[a-zA-Z0-9]+                 2          1957            22        978.50x       11.00x
+Word \w+              \w+                          2          1241            17        620.50x        8.50x
+Digit \d+             \d+                          2           880            15        440.00x        7.50x
 ...
 ------------------------------------------------------------------------------------------------------------------------
-Average Speedup:                                                                        316.90x        3.91x
+Average Speedup:                                                                        330.80x        4.30x
 ========================================================================================================================
 ```
 
