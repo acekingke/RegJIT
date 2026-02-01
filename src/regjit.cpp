@@ -85,6 +85,75 @@ extern "C" void regjit_trace(const char* tag, int idx, int cnt) {
     RJDBG(fprintf(stderr, "regjit_trace: %s idx=%d cnt=%d\n", tag, idx, cnt));
 }
 
+// Boyer-Moore-Horspool string search implementation with memchr optimization.
+// Returns pointer to first occurrence of needle in haystack, or nullptr if not found.
+// This combines BMH bad-character shifts with memchr SIMD acceleration.
+extern "C" const char* regjit_bmh_search(const char* haystack, size_t haystackLen,
+                                          const char* needle, size_t needleLen) {
+    if (needleLen == 0) return haystack;
+    if (needleLen > haystackLen) return nullptr;
+    
+    // For single character, just use memchr (SIMD optimized)
+    if (needleLen == 1) {
+        return (const char*)memchr(haystack, needle[0], haystackLen);
+    }
+    
+    // For short needles (2-3 chars), use memchr + verify approach
+    // This is typically faster than building the shift table
+    if (needleLen <= 3) {
+        const char* p = haystack;
+        const char* end = haystack + haystackLen - needleLen + 1;
+        const char firstChar = needle[0];
+        
+        while (p < end) {
+            p = (const char*)memchr(p, firstChar, end - p);
+            if (!p) return nullptr;
+            if (memcmp(p, needle, needleLen) == 0) return p;
+            p++;
+        }
+        return nullptr;
+    }
+    
+    // For longer needles, use full BMH with memchr for initial search
+    const char firstChar = needle[0];
+    const char lastChar = needle[needleLen - 1];
+    const size_t lastIdx = needleLen - 1;
+    
+    // Build the bad character shift table (only for chars in needle)
+    // Using a simple array is faster than unordered_map
+    size_t shift[256];
+    for (int i = 0; i < 256; i++) {
+        shift[i] = needleLen;
+    }
+    for (size_t i = 0; i < needleLen - 1; i++) {
+        shift[(unsigned char)needle[i]] = needleLen - 1 - i;
+    }
+    
+    // Use memchr to find first char, then verify with BMH-style shifts
+    const char* p = haystack;
+    const char* end = haystack + haystackLen;
+    
+    while (p <= end - needleLen) {
+        // Use memchr to find first character (SIMD accelerated)
+        p = (const char*)memchr(p, firstChar, end - p - lastIdx);
+        if (!p) return nullptr;
+        
+        // Check last char quickly
+        if (p[lastIdx] == lastChar) {
+            // Full comparison (skip first and last which we already checked)
+            if (needleLen == 2 || memcmp(p + 1, needle + 1, needleLen - 2) == 0) {
+                return p;  // Found!
+            }
+        }
+        
+        // Move forward - use BMH shift if beneficial, otherwise just +1
+        size_t bmhShift = shift[(unsigned char)p[lastIdx]];
+        p += (bmhShift > 1) ? bmhShift : 1;
+    }
+    
+    return nullptr;  // Not found
+}
+
 // NOTE: previous attempts to defensively create new blocks when the current
 // insert block already had a terminator caused verifier failures because some
 // of those helper-created blocks remained empty (no terminator). Instead of
@@ -626,26 +695,27 @@ Value* Func::CodeGen() {
         Type* sizeTy = Builder.getInt64Ty();
 
         if (isPureLiteral && literalPrefix.length() > 0) {
-            // === MEMMEM OPTIMIZATION PATH ===
-            // For pure literal patterns, use memmem to find the entire string at once
-            // This is the fastest path - O(n) with good constants
+            // === BOYER-MOORE-HORSPOOL OPTIMIZATION PATH ===
+            // For pure literal patterns, use BMH to find the entire string at once
+            // This is faster than memmem on macOS for longer patterns
             
-            RJDBG(std::cerr << "Using memmem optimization for literal: " << literalPrefix << "\n");
+            RJDBG(std::cerr << "Using BMH optimization for literal: " << literalPrefix << "\n");
             
-            // Declare memmem: void* memmem(const void* haystack, size_t haystacklen,
-            //                              const void* needle, size_t needlelen)
-            FunctionCallee memmemFn = ThisModule->getOrInsertFunction("memmem",
+            // Declare regjit_bmh_search: const char* regjit_bmh_search(
+            //     const char* haystack, size_t haystacklen,
+            //     const char* needle, size_t needlelen)
+            FunctionCallee bmhFn = ThisModule->getOrInsertFunction("regjit_bmh_search",
                 FunctionType::get(i8ptrTy, {i8ptrTy, sizeTy, i8ptrTy, sizeTy}, false));
             
             // Create a global string constant for the needle
             Value* needlePtr = Builder.CreateGlobalStringPtr(literalPrefix, "needle");
             Value* needleLen = ConstantInt::get(sizeTy, literalPrefix.length());
             
-            // Call memmem(Arg0, strlen, needle, needlelen)
+            // Call regjit_bmh_search(Arg0, strlen, needle, needlelen)
             Value* haystackLen = Builder.CreateZExt(strlenVal, sizeTy);
-            Value* foundPtr = Builder.CreateCall(memmemFn, {Arg0, haystackLen, needlePtr, needleLen});
+            Value* foundPtr = Builder.CreateCall(bmhFn, {Arg0, haystackLen, needlePtr, needleLen});
             
-            // Check if memmem found anything
+            // Check if BMH found anything (returns nullptr if not found)
             Value* isNull = Builder.CreateICmpEQ(foundPtr, ConstantPointerNull::get(cast<PointerType>(i8ptrTy)));
             Builder.CreateCondBr(isNull, ReturnFailBB, ReturnSuccessBB);
             
