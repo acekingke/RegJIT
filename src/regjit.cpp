@@ -7,6 +7,14 @@
 #include <chrono>
 #include "llvm/IR/Verifier.h"
 
+// ARM NEON SIMD support
+#if defined(__ARM_NEON) || defined(__aarch64__)
+#include <arm_neon.h>
+#define HAS_NEON 1
+#else
+#define HAS_NEON 0
+#endif
+
 // Debug printing macro: enable by defining REGJIT_DEBUG (e.g. -DREGJIT_DEBUG)
 #ifdef REGJIT_DEBUG
 #define RJDBG(x) x
@@ -155,20 +163,48 @@ extern "C" const char* regjit_bmh_search(const char* haystack, size_t haystackLe
 }
 
 // Count consecutive occurrences of a character starting from pos.
-// Uses memchr to find the first non-matching character efficiently.
+// Uses SIMD when available for faster scanning.
 // Returns the count of consecutive matching characters.
 extern "C" size_t regjit_count_char(const char* str, size_t len, char target) {
     if (len == 0) return 0;
     
-    // Find the first character that is NOT the target
-    // We scan byte by byte until we find a non-match
-    // Note: there's no "memchr_not" in libc, but we can use a simple loop
-    // that the compiler will often vectorize, or scan in chunks
+#if HAS_NEON
+    // ARM NEON optimized path (Apple Silicon, ARM64)
+    size_t count = 0;
+    uint8x16_t vtarget = vdupq_n_u8((uint8_t)target);
     
+    // Process 16 bytes at a time with NEON
+    while (count + 16 <= len) {
+        uint8x16_t vdata = vld1q_u8((const uint8_t*)(str + count));
+        uint8x16_t vcmp = vceqq_u8(vdata, vtarget);
+        
+        // Check if all 16 bytes match using 64-bit lane comparison
+        uint64x2_t vcmp64 = vreinterpretq_u64_u8(vcmp);
+        uint64_t low = vgetq_lane_u64(vcmp64, 0);
+        uint64_t high = vgetq_lane_u64(vcmp64, 1);
+        
+        if (low == 0xFFFFFFFFFFFFFFFFULL && high == 0xFFFFFFFFFFFFFFFFULL) {
+            count += 16;
+        } else {
+            // Some bytes don't match - find the first non-match
+            for (int i = 0; i < 16 && count + i < len; i++) {
+                if (str[count + i] != target) return count + i;
+            }
+            count += 16;
+        }
+    }
+    
+    // Handle remaining bytes
+    while (count < len && str[count] == target) {
+        count++;
+    }
+    return count;
+    
+#else
+    // Generic optimized path - unroll loop for better pipelining
     size_t count = 0;
     
-    // For very long runs, process in chunks to help vectorization
-    // Check 8 bytes at a time when possible
+    // Process 8 bytes at a time
     while (count + 8 <= len) {
         if (str[count] != target) return count;
         if (str[count + 1] != target) return count + 1;
@@ -187,6 +223,7 @@ extern "C" size_t regjit_count_char(const char* str, size_t len, char target) {
     }
     
     return count;
+#endif
 }
 
 // NOTE: previous attempts to defensively create new blocks when the current
