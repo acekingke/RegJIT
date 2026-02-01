@@ -109,6 +109,16 @@ static void ensureBlockHasTerminator(BasicBlock* B, BasicBlock* target) {
     }
 }
 
+// Reset compile-time state after a failed compile.
+static void resetCompileState() {
+    ThisModule.reset();
+    OwnedCompileBuilder.reset();
+    OwnedCompileContext.reset();
+    ContextPtr = &GlobalContext;
+    BuilderPtr = &GlobalBuilder;
+    FunctionName.clear();
+}
+
 // compile-or-get with cache. This uses CompileRegex which generates IR into
 // the global ThisModule and calls Compile() to add it to the JIT. We hold
 // CompileCacheMutex during compilation to avoid races and RT being overwritten.
@@ -174,11 +184,7 @@ CompiledEntry getOrCompile(const std::string &pattern) {
 
       // Call existing CompileRegex which will fill ThisModule and call Compile()
       if (!CompileRegex(pattern)) {
-        // restore global pointers on failure
-        ContextPtr = &GlobalContext;
-        BuilderPtr = &GlobalBuilder;
-        OwnedCompileBuilder.reset();
-        OwnedCompileContext.reset();
+        resetCompileState();
         // signal failure and clean inflight
         prom->set_value(false);
         std::lock_guard<std::mutex> lk2(CompileCacheMutex);
@@ -438,9 +444,9 @@ void Compile() {
   // LLVMContext. OptimizeModule expects the Module to be backed by the
   // same LLVMContext used to generate the IR, so we must call it while
   // OwnedCompileContext is still alive.
-  // Dump the module to a temporary file for debugging (always) so we can
+  // Dump the module to a temporary file for debugging so we can
   // inspect IR that triggers optimizer crashes.
-  {
+  RJDBG({
     // Create a unique dump path using timestamp + thread id to avoid needing
     // platform-specific getpid(). This avoids including <unistd.h> here.
     auto now = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -455,7 +461,7 @@ void Compile() {
     } else {
       errs() << "Failed to open dump file: " << EC.message() << "\n";
     }
-  }
+  });
   // Verify IR before running optimizer to avoid crashes in LLVM when IR is
   // malformed. If verification fails, write the dump and abort compilation
   // so we can fix the generator instead of crashing inside the optimizer.
@@ -802,6 +808,7 @@ Value* Repeat::CodeGen() {
     // Plus: minCount=1, maxCount=-1
     bool isStar = (minCount == 0 && maxCount == -1);
     bool isPlus = (minCount == 1 && maxCount == -1);
+    Value* savedIdx = Builder.CreateAlloca(intTy);
     
     if (isStar || isPlus) {
         // For zero-width bodies (anchors, lookarounds), we need special handling
@@ -843,31 +850,46 @@ Value* Repeat::CodeGen() {
         BasicBlock* exitBlock = BasicBlock::Create(Context, "repeat_exit", MatchF);
 
         if (!isStar) { // Plus: must match at least once
+            Value* curIdx = Builder.CreateLoad(intTy, Index);
+            Builder.CreateStore(curIdx, savedIdx);
+            BasicBlock* firstFailRestore = BasicBlock::Create(Context, "repeat_first_fail_restore", MatchF);
             Body->SetSuccessBlock(checkBlock);
-            Body->SetFailBlock(GetFailBlock());
+            Body->SetFailBlock(firstFailRestore);
             Body->CodeGen();
+            Builder.SetInsertPoint(firstFailRestore);
+            Value* restore = Builder.CreateLoad(intTy, savedIdx);
+            Builder.CreateStore(restore, Index);
+            Builder.CreateBr(GetFailBlock());
         } else { // Star: can match zero times
             Builder.CreateBr(checkBlock);
         }
 
         Builder.SetInsertPoint(checkBlock);
 
+        BasicBlock* failRestore = BasicBlock::Create(Context, "repeat_fail_restore", MatchF);
         if (nonGreedy) {
             // Non-greedy: first try to exit, then try to match
             Builder.CreateCondBr(Builder.getTrue(), GetSuccessBlock(), bodyBlock);
         } else {
             // Greedy: first try to match, then exit on failure
             Body->SetSuccessBlock(checkBlock); // Loop back on success
-            Body->SetFailBlock(exitBlock);   // Exit on failure
+            Body->SetFailBlock(failRestore);   // Restore index then exit
             Builder.CreateBr(bodyBlock);
         }
 
         Builder.SetInsertPoint(bodyBlock);
+        Value* curIdx = Builder.CreateLoad(intTy, Index);
+        Builder.CreateStore(curIdx, savedIdx);
         Body->CodeGen();
         if (Builder.GetInsertBlock()->getTerminator() == nullptr) {
           if (nonGreedy) Builder.CreateBr(checkBlock);
-          else Builder.CreateBr(exitBlock);
+          else Builder.CreateBr(failRestore);
         }
+
+        Builder.SetInsertPoint(failRestore);
+        Value* restore = Builder.CreateLoad(intTy, savedIdx);
+        Builder.CreateStore(restore, Index);
+        Builder.CreateBr(exitBlock);
 
         Builder.SetInsertPoint(exitBlock);
         Builder.CreateBr(GetSuccessBlock());
@@ -1092,6 +1114,10 @@ class RegexParser {
             negated = true;
             m_cur_token = m_lexer.get_next_token();
         }
+
+        if (m_cur_token.type == RegexLexer::RBRACKET) {
+            throw std::runtime_error("unterminated character set");
+        }
         
         auto charClass = std::make_unique<CharClass>(negated, false);
         
@@ -1112,6 +1138,9 @@ class RegexParser {
                         throw std::runtime_error("Invalid range in character class");
                     }
                     char endChar = m_cur_token.value;
+                    if (endChar < startChar) {
+                        throw std::runtime_error("bad character range");
+                    }
                     m_cur_token = m_lexer.get_next_token();
                     
                     // Add range
@@ -1131,6 +1160,15 @@ class RegexParser {
     }
 
     std::unique_ptr<Root> parse_element() {
+    if (m_cur_token.type == RegexLexer::STAR ||
+        m_cur_token.type == RegexLexer::PLUS ||
+        m_cur_token.type == RegexLexer::QMARK ||
+        m_cur_token.type == RegexLexer::LBRACE) {
+            throw std::runtime_error("nothing to repeat");
+        }
+    if (m_cur_token.type == RegexLexer::RPAREN) {
+            throw std::runtime_error("unbalanced parenthesis");
+        }
     if (m_cur_token.type == RegexLexer::LPAREN) {
             // Support normal groups and non-capturing groups like (?:...)
             m_cur_token = m_lexer.get_next_token();
@@ -1239,6 +1277,12 @@ class RegexParser {
             switch (m_cur_token.type) {
                 case RegexLexer::STAR: {
                     m_cur_token = m_lexer.get_next_token();
+                    if (dynamic_cast<Repeat*>(node.get()) != nullptr) {
+                        throw std::runtime_error("multiple repeat");
+                    }
+                    if (node->isZeroWidth()) {
+                        throw std::runtime_error("nothing to repeat");
+                    }
                     // 看后缀?判断贪婪/非贪婪
                     bool nongreedy = false;
                     if (m_cur_token.type == RegexLexer::QMARK) {
@@ -1250,6 +1294,12 @@ class RegexParser {
                 }
                 case RegexLexer::PLUS: {
                     m_cur_token = m_lexer.get_next_token();
+                    if (dynamic_cast<Repeat*>(node.get()) != nullptr) {
+                        throw std::runtime_error("multiple repeat");
+                    }
+                    if (node->isZeroWidth()) {
+                        throw std::runtime_error("nothing to repeat");
+                    }
                     bool nongreedy = false;
                     if (m_cur_token.type == RegexLexer::QMARK) {
                         nongreedy = true;
@@ -1260,6 +1310,12 @@ class RegexParser {
                 }
                 case RegexLexer::QMARK: {
                     m_cur_token = m_lexer.get_next_token();
+                    if (dynamic_cast<Repeat*>(node.get()) != nullptr) {
+                        throw std::runtime_error("multiple repeat");
+                    }
+                    if (node->isZeroWidth()) {
+                        throw std::runtime_error("nothing to repeat");
+                    }
                     // 实现?量词: 转换为{0,1} 
                     bool nongreedy = false;
                     if (m_cur_token.type == RegexLexer::QMARK) {
@@ -1274,6 +1330,12 @@ class RegexParser {
                     int min = 0, max = -1;
                     bool nongreedy = false;
                     m_cur_token = m_lexer.get_next_token();
+                    if (dynamic_cast<Repeat*>(node.get()) != nullptr) {
+                        throw std::runtime_error("multiple repeat");
+                    }
+                    if (node->isZeroWidth()) {
+                        throw std::runtime_error("nothing to repeat");
+                    }
                     // 首先读min
                     if (m_cur_token.type != RegexLexer::CHAR || !isdigit(m_cur_token.value))
                         throw std::runtime_error("Malformed quantifier: expected digit after '{'");
@@ -1781,13 +1843,8 @@ bool CompileRegex(const std::string& pattern) {
         return true;
     } catch (const std::exception &e) {
         std::cerr << "CompileRegex failed for pattern '" << pattern << "': " << e.what() << "\n";
-        // restore globals if we created per-compile context
-        if (createdContext) {
-            OwnedCompileBuilder.reset();
-            OwnedCompileContext.reset();
-            ContextPtr = &GlobalContext;
-            BuilderPtr = &GlobalBuilder;
-        }
+        // restore globals and drop any partially built module
+        resetCompileState();
         return false;
     }
 }

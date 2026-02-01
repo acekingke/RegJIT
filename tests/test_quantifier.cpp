@@ -91,14 +91,22 @@ void test_greedy_lazy() {
 
 void test_error_cases() {
     std::cout << "Testing error cases..." << std::endl;
-    // NOTE: Testing compilation failure cases is currently problematic because
-    // CleanUp() after a failed compile may hang. This is a known issue.
-    // The parser correctly rejects malformed patterns like:
-    //   - "e{,4}" - missing min value
-    //   - "f{5,3}" - min > max
-    //   - "g{}" - empty braces
-    // These are verified manually to print error messages and return false.
-    std::cout << "  test_error_cases skipped (known issue with CleanUp after failed compile)" << std::endl;
+    Initialize();
+    bool ok = CompileRegex("e{,4}");
+    assert(!ok && "e{,4} should fail to compile (missing min)");
+    CleanUp();
+
+    Initialize();
+    ok = CompileRegex("f{5,3}");
+    assert(!ok && "f{5,3} should fail to compile (min > max)");
+    CleanUp();
+
+    Initialize();
+    ok = CompileRegex("g{}");
+    assert(!ok && "g{} should fail to compile (empty braces)");
+    CleanUp();
+
+    std::cout << "  test_error_cases passed" << std::endl;
 }
 
 int main() {

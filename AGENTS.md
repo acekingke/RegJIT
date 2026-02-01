@@ -142,6 +142,53 @@ void OptimizeModule(Module& M) {
 - `+` - 一次或多次重复  
 - 精确次数重复
 
+## 🐛 调试手段
+
+### REGJIT_DEBUG 编译标志
+
+项目提供了编译时调试开关 `REGJIT_DEBUG`，用于输出 LLVM IR 和诊断信息。
+
+#### 启用方式
+
+在 Makefile 中通过 `REGJIT_DEBUG` 变量控制：
+
+```bash
+# 编译带调试输出的目标
+make REGJIT_DEBUG=1 src/regjit.o
+
+# 编译并运行调试测试
+make clean && make REGJIT_DEBUG=1 test_wrong && ./test_wrong
+
+# 编译任意测试目标
+make REGJIT_DEBUG=1 test_anchor
+```
+
+#### 输出内容
+
+启用后会输出：
+1. **生成的 LLVM IR** - 完整的中间表示代码
+2. **编译上下文诊断** - `OwnedCompileContext` 和 `ThisModule` 地址信息
+
+#### 实现原理 (`src/regjit.cpp`)
+
+```cpp
+// 调试宏定义
+#ifdef REGJIT_DEBUG
+#define RJDBG(x) x        // 启用时：执行调试代码
+#else
+#define RJDBG(x) do {} while(0)  // 禁用时：空操作
+#endif
+
+// 使用示例
+RJDBG({ outs() << "\nGenerated LLVM IR:\n"; ThisModule->print(outs(), nullptr); });
+```
+
+#### 典型用途
+- 调试正则表达式到 LLVM IR 的编译过程
+- 验证生成的 IR 是否正确
+- 排查 JIT 编译器内部问题
+- 分析优化前后的 IR 差异
+
 ## 💡 应用场景
 
 1. **高频文本处理**: 日志分析、数据清洗
@@ -175,7 +222,7 @@ void OptimizeModule(Module& M) {
 
 ### **待实现功能**
 
-#### 1. **转义序列支持** (🔄 进行中 - 高优先级)
+#### 1. **转义序列支持** (✅ 已完成)
 
 **实现内容：**
 - `\d`, `\D` - 数字/非数字 `[0-9]` / `[^0-9]`
@@ -190,11 +237,13 @@ void OptimizeModule(Module& M) {
 - ⚠️ 与锚点结合时有问题（如 `^d{2,4}?$` 匹配 "ddd" 失败）
 - 需要实现回溯支持来完善
 
-#### 3. **Python re 语法验证** (中优先级)
+#### 3. **Python re 语法验证** (进行中)
 
 **实现内容：**
-- 在编译时拒绝 `^*`, `$+`, `\b{2}` 等非法模式
-- 抛出与 Python re 兼容的错误信息
+- ✅ 在编译时拒绝 `^*`, `$+`, `\b{2}` 等零宽度断言量词
+- ✅ 补充起始量词/重复量词/括号不匹配/空字符类等错误覆盖
+- ✅ 补充未闭合 `{` / `[`, 空分组 `()`, 反向范围等错误覆盖
+- 🔄 继续补充 Python re 兼容的错误信息一致性
 
 #### 4. **捕获组支持** (低优先级)
 
@@ -349,7 +398,10 @@ print(r.match('ab'))    # False
 | 问题 | 状态 | 说明 |
 |------|------|------|
 | 非贪心 `{n,m}?` + 锚点 | 待修复 | 需要回溯支持 |
-| CleanUp 后编译失败挂起 | 待修复 | 状态未正确重置 |
+| CleanUp 后编译失败挂起 | 已修复 | 失败编译路径已重置编译状态 |
+| `test_error_cases` 被跳过 | 已修复 | 失败编译用例已恢复测试 |
+| 锚点+量词非法模式缺少失败测试 | 已修复 | 已添加失败编译测试 |
+| 旧计划文档未更新 | 已更新 | `docs/plans/2025-01-26-charclass-implementation.md` |
 
 #### 提交记录
 ```
@@ -401,3 +453,10 @@ ce6f6d1 fix(cache): resolve getOrCompile deadlock and improve Python bindings
 #### 测试状态
 - ✅ C++ 测试 (`make test_all`) - 全部通过
 - ✅ Python 测试 (`test_bindings.py`, `test_cache_eviction.py`) - 全部通过
+- ✅ 转义序列测试 (`make test_escape && ./test_escape`) - 全部通过（2026-01-30）
+- ✅ 锚点测试 (`make test_anchor && ./test_anchor`) - 全部通过（2026-01-30）
+- ✅ 锚点/量词边缘测试 (`make test_anchor_quant_edge && ./test_anchor_quant_edge`) - 全部通过（2026-01-30）
+- ✅ 分组测试 (`make test_group && ./test_group`) - 全部通过（2026-01-30）
+- ✅ 语法错误测试 (`make test_syntax && ./test_syntax`) - 全部通过（2026-01-30）
+- ✅ 语法错误扩展测试 (`make test_syntax && ./test_syntax`) - 全部通过（2026-01-30）
+- ✅ 语法错误覆盖完善 (`make test_syntax && ./test_syntax`) - 全部通过（2026-01-30）

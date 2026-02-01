@@ -1,7 +1,17 @@
+# Debug mode: set REGJIT_DEBUG=1 to enable IR dump and diagnostic output
+# Usage: make REGJIT_DEBUG=1 test_wrong
+#        make REGJIT_DEBUG=1 src/regjit.o
+REGJIT_DEBUG ?= 0
+
 DEBUG_FLAGS := -g -O0
 LLVM_CONFIG := /opt/homebrew/Cellar/llvm/19.1.7_1/bin/llvm-config
 CXXFLAGS := $(DEBUG_FLAGS) -Wall -Wno-unknown-warning-option -std=c++17
 CXXFLAGS += $(shell $(LLVM_CONFIG) --cxxflags)
+
+# Add REGJIT_DEBUG flag if enabled
+ifeq ($(REGJIT_DEBUG),1)
+CXXFLAGS += -DREGJIT_DEBUG
+endif
 
 LDFLAGS  := $(shell $(LLVM_CONFIG) --ldflags)
 LDLIBS   := $(shell $(LLVM_CONFIG) --libs core)
@@ -63,6 +73,12 @@ test_quantifier: tests/test_quantifier.cpp $(REGJIT_OBJ)
 test_escape: tests/test_escape.cpp $(REGJIT_OBJ)
 	$(CXX) $(CXXFLAGS) -I./src -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
+test_group: tests/test_group.cpp $(REGJIT_OBJ)
+	$(CXX) $(CXXFLAGS) -I./src -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+test_syntax: tests/test_syntax.cpp $(REGJIT_OBJ)
+	$(CXX) $(CXXFLAGS) -I./src -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
 simple_anchor_test: tests/simple_anchor_test.cpp $(REGJIT_OBJ)
 	$(CXX) $(CXXFLAGS) -I./src -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
@@ -91,10 +107,10 @@ test_basic_multi: test_basic_multi.cpp $(REGJIT_OBJ)
 	$(CXX) $(CXXFLAGS) -I./src -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
 test_wrong: tests/test_wrong.cpp $(REGJIT_OBJ)
-	$(CXX) -DREGJIT_DEBUG $(CXXFLAGS) -I./src -o $@ $^ $(LDFLAGS) $(LDLIBS)
+	$(CXX) $(CXXFLAGS) -I./src -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
 # Run all tests in tests directory
-test_all: test_charclass test_anchor test_quantifier test_escape test_anchor_quant_edge test_cleanup simple_anchor_test
+test_all: test_charclass test_anchor test_quantifier test_escape test_anchor_quant_edge test_cleanup simple_anchor_test test_group test_syntax
 	@echo "Running all tests in tests/ directory..."
 	@if [ -f test_charclass ]; then echo "=== Running test_charclass ==="; ./test_charclass || echo "test_charclass failed"; fi
 	@if [ -f test_anchor ]; then echo "=== Running test_anchor ==="; timeout 3 ./test_anchor || echo "test_anchor failed or timed out"; fi
@@ -103,6 +119,8 @@ test_all: test_charclass test_anchor test_quantifier test_escape test_anchor_qua
 	@if [ -f test_anchor_quant_edge ]; then echo "=== Running test_anchor_quant_edge ==="; timeout 3 ./test_anchor_quant_edge || echo "test_anchor_quant_edge failed or timed out"; fi
 	@if [ -f test_cleanup ]; then echo "=== Running test_cleanup ==="; ./test_cleanup || echo "test_cleanup failed"; fi
 	@if [ -f simple_anchor_test ]; then echo "=== Running simple_anchor_test ==="; ./simple_anchor_test || echo "simple_anchor_test failed"; fi
+	@if [ -f test_group ]; then echo "=== Running test_group ==="; timeout 10 ./test_group || echo "test_group failed or timed out"; fi
+	@if [ -f test_syntax ]; then echo "=== Running test_syntax ==="; timeout 10 ./test_syntax || echo "test_syntax failed or timed out"; fi
 	@echo "All tests completed!"
 
 bench: src/benchmark.cpp src/regjit.o
@@ -121,11 +139,13 @@ clean_tests:
 	rm -f test_charclass test_anchor test_quantifier test_anchor_quant_edge test_cleanup test_charclass_only test_simple_charclass debug simple_anchor_test simple_test final_test
 
 # Quick test - run only main functionality tests
-test_quick: test_anchor test_charclass test_quantifier
+test_quick: test_anchor test_charclass test_quantifier test_group test_syntax
 	@echo "Running quick tests (main functionality)..."
 	@if [ -f test_anchor ]; then echo "=== Running test_anchor ==="; timeout 3 ./test_anchor || echo "test_anchor failed or timed out"; fi
 	@if [ -f test_charclass ]; then echo "=== Running test_charclass ==="; ./test_charclass || echo "test_charclass failed"; fi
 	@if [ -f test_quantifier ]; then echo "=== Running test_quantifier ==="; timeout 15 ./test_quantifier || echo "test_quantifier failed or timed out"; fi
+	@if [ -f test_group ]; then echo "=== Running test_group ==="; timeout 10 ./test_group || echo "test_group failed or timed out"; fi
+	@if [ -f test_syntax ]; then echo "=== Running test_syntax ==="; timeout 10 ./test_syntax || echo "test_syntax failed or timed out"; fi
 	@echo "Quick tests completed!"
 
 # Help target
@@ -140,3 +160,7 @@ help:
 	@echo "  bench         - Build benchmark"
 	@echo "  sample        - Build sample"
 	@echo "  help          - Show this help"
+	@echo ""
+	@echo "Debug mode:"
+	@echo "  make REGJIT_DEBUG=1 <target>  - Enable IR dump and diagnostic output"
+	@echo "  Example: make REGJIT_DEBUG=1 test_wrong"
