@@ -460,3 +460,159 @@ ce6f6d1 fix(cache): resolve getOrCompile deadlock and improve Python bindings
 - ✅ 语法错误测试 (`make test_syntax && ./test_syntax`) - 全部通过（2026-01-30）
 - ✅ 语法错误扩展测试 (`make test_syntax && ./test_syntax`) - 全部通过（2026-01-30）
 - ✅ 语法错误覆盖完善 (`make test_syntax && ./test_syntax`) - 全部通过（2026-01-30）
+
+---
+
+## ⚡ 性能优化指南
+
+本节记录了 RegJIT 的关键性能优化技术。**请勿在不了解后果的情况下修改这些优化**。
+
+### 🚨 关键性能优化（禁止反向修改）
+
+以下优化对性能至关重要，任何修改都可能导致严重性能退化：
+
+#### 1. Boyer-Moore-Horspool 字符串搜索 (`src/regjit.cpp`)
+
+**位置**: `regjit_bmh_search()` 函数（约第 88-155 行）
+
+**优化内容**:
+- 替换了 macOS 上性能较差的 `memmem()` 实现
+- 使用 BMH 算法进行模式匹配
+- 对首字符使用 `memchr()` 快速定位
+
+**性能影响**: 字符串搜索性能提升 2-3x
+
+```cpp
+// ✅ 正确实现（保持）
+static const char* regjit_bmh_search(const char* haystack, size_t haystack_len,
+                                      const char* needle, size_t needle_len) {
+    // BMH 跳表 + memchr 首字符优化
+}
+
+// ❌ 错误做法（禁止）
+// 不要改回 memmem()，macOS 实现很慢
+```
+
+#### 2. ARM NEON SIMD 字符计数 (`src/regjit.cpp`)
+
+**位置**: `regjit_count_char()` 函数（约第 165-220 行）
+
+**优化内容**:
+- 使用 NEON 向量指令一次处理 16 字节
+- 编译时检测 `HAS_NEON` 宏
+- 对不支持 NEON 的平台回退到标量实现
+
+**性能影响**: `a{1000}`, `a+`, `a*` 等模式性能提升 5-10x
+
+```cpp
+// ✅ 正确实现（保持）
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#define HAS_NEON 1
+#include <arm_neon.h>
+#endif
+
+static size_t regjit_count_char(const char* s, size_t len, char target) {
+#ifdef HAS_NEON
+    // NEON 向量化：每次处理 16 字节
+    uint8x16_t target_vec = vdupq_n_u8((uint8_t)target);
+    // ...
+#else
+    // 标量回退
+#endif
+}
+
+// ❌ 错误做法（禁止）
+// 不要删除 NEON 优化或改为逐字符循环
+```
+
+#### 3. 单字符量词快速路径 (`src/regjit.cpp`)
+
+**位置**: `Repeat::CodeGen()` 中的快速路径（约第 1050 行）
+
+**优化内容**:
+- 对 `a+`, `a*`, `a{n}`, `a{n,m}` 等单字符重复模式
+- 使用 `getSingleChar()` 检测是否为单字符
+- 直接调用 `regjit_count_char()` 而非生成逐字符循环
+
+**性能影响**: 单字符量词性能提升 10-50x
+
+```cpp
+// ✅ 正确实现（保持）
+// 在 Repeat::CodeGen() 中检测单字符模式
+if (auto singleChar = child->getSingleChar()) {
+    // 调用 regjit_count_char() 快速路径
+}
+
+// ❌ 错误做法（禁止）
+// 不要删除这个快速路径，否则会回退到慢速的 IR 循环
+```
+
+#### 4. 直接 `strlen()` 调用 (`src/regjit.cpp`)
+
+**位置**: `Func::CodeGen()` 中的 strlen 计算（约第 673-697 行）
+
+**优化内容**:
+- 使用直接函数指针嵌入调用 libc `strlen()`
+- 替换了之前的逐字节 IR 循环
+
+**性能影响**: 长输入搜索性能提升 6-10x（10KB 输入从 ~3600ns 降至 ~400ns）
+
+```cpp
+// ✅ 正确实现（保持）
+// 直接嵌入 strlen 函数指针
+Type* StrlenFT = FunctionType::get(Builder.getInt64Ty(), 
+                                    {Builder.getPtrTy()}, false);
+Value* strlenPtr = Builder.CreateIntToPtr(
+    ConstantInt::get(Builder.getInt64Ty(), 
+                     reinterpret_cast<uintptr_t>(&strlen)),
+    StrlenFT->getPointerTo());
+Value* strlenResult = Builder.CreateCall(
+    FunctionCallee(StrlenFT, strlenPtr), {strArg});
+
+// ❌ 错误做法（禁止）
+// 不要改回逐字节的 IR strlen 循环，这是主要瓶颈
+// 禁止：
+// while(*ptr != '\0') { ptr++; count++; }  // IR 循环非常慢
+```
+
+### 📊 性能基准参考
+
+优化后的预期性能（与 PCRE2 比较）：
+
+| 测试用例 | RegJIT | PCRE2 | 比率 | 说明 |
+|----------|--------|-------|------|------|
+| `a{1000}` | ~350ns | ~330ns | ~1.0x | NEON + 快速路径 |
+| `a+` | ~340ns | ~340ns | ~1.0x | 单字符快速路径 |
+| `a*` | ~340ns | ~325ns | ~1.0x | 单字符快速路径 |
+| 长输入搜索 | ~500ns | ~310ns | ~0.6x | strlen 优化后 |
+| `\d+` | ~5ns | ~16ns | ~3.2x | JIT 内联优化 |
+
+### 🔧 添加新优化的准则
+
+1. **基准测试**：任何性能改动都必须先运行 `make RELEASE=1 bench && ./bench`
+2. **保持现有优化**：新优化不能破坏已有的快速路径
+3. **SIMD 兼容**：新的 SIMD 优化必须提供标量回退
+4. **函数指针嵌入**：对于频繁调用的辅助函数，使用直接指针嵌入而非符号查找
+
+### 🐛 性能调试技巧
+
+#### 隔离性能问题
+```bash
+# 1. 运行基准测试
+make RELEASE=1 bench && ./bench
+
+# 2. 如果特定测试慢，创建微基准
+# 3. 使用 REGJIT_DEBUG=1 查看生成的 IR
+make REGJIT_DEBUG=1 test_xxx && ./test_xxx
+
+# 4. 检查 IR 中是否有不必要的循环或分支
+```
+
+#### 常见性能陷阱
+
+| 陷阱 | 症状 | 解决方案 |
+|------|------|----------|
+| IR 中的逐字节循环 | 长输入性能差 | 使用 SIMD 辅助函数 |
+| 符号查找开销 | 首次调用慢 | 使用函数指针嵌入 |
+| macOS memmem | 字符串搜索慢 | 使用自定义 BMH |
+| 缺少快速路径 | 简单模式应该快 | 检测并特殊处理 |

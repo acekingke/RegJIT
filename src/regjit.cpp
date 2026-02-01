@@ -676,45 +676,26 @@ Value* Func::CodeGen() {
     Index = Builder.CreateAlloca(Builder.getInt32Ty());
     Builder.CreateStore(ConstantInt::get(Context, APInt(32, 0)), Index);
     
-    // Compute string length inline (avoid external strlen calls which can
-    // produce renamed declarations like "strlen.1" across module boundaries
-    // and complicate JIT symbol resolution on some platforms).
+    // Compute string length using libc strlen (with direct function pointer)
+    // This is much faster than the inline loop for long strings
     StrLenAlloca = Builder.CreateAlloca(Builder.getInt32Ty());
-    // temp index for strlen loop
-    Value *lenIdx = Builder.CreateAlloca(Builder.getInt32Ty());
-    Builder.CreateStore(ConstantInt::get(Context, APInt(32, 0)), lenIdx);
-
-    BasicBlock *StrlenCondBB = BasicBlock::Create(Context, "strlen_cond", MatchF);
-    BasicBlock *StrlenBodyBB = BasicBlock::Create(Context, "strlen_body", MatchF);
-    // Create the post-strlen continuation block early so we can guarantee
-    // strlen_done branches to it and thus always has a terminator.
+    
+    Type* i8ptrTy = PointerType::get(Builder.getInt8Ty(), 0);
+    Type* sizeTy = Builder.getInt64Ty();
+    
+    // Get strlen function pointer directly
+    FunctionType* strlenFnTy = FunctionType::get(sizeTy, {i8ptrTy}, false);
+    auto strlenAddr = reinterpret_cast<uintptr_t>(&strlen);
+    Value* strlenPtrInt = ConstantInt::get(Builder.getInt64Ty(), strlenAddr);
+    Value* strlenPtr = Builder.CreateIntToPtr(strlenPtrInt, PointerType::get(strlenFnTy, 0));
+    
+    // Call strlen and truncate to i32
+    Value* strlenResult = Builder.CreateCall(strlenFnTy, strlenPtr, {Arg0});
+    Value* strlenVal32 = Builder.CreateTrunc(strlenResult, Builder.getInt32Ty());
+    Builder.CreateStore(strlenVal32, StrLenAlloca);
+    
     BasicBlock *PostStrlenBB = BasicBlock::Create(Context, "post_strlen", MatchF);
-    BasicBlock *StrlenDoneBB = BasicBlock::Create(Context, "strlen_done", MatchF);
-
-    // Jump to condition
-    Builder.CreateBr(StrlenCondBB);
-
-    // Condition: load char at cur index and test null
-    Builder.SetInsertPoint(StrlenCondBB);
-    Value *curLen = Builder.CreateLoad(Builder.getInt32Ty(), lenIdx);
-    Value *charPtr = Builder.CreateGEP(Builder.getInt8Ty(), Arg0, {curLen});
-    Value *ch = Builder.CreateLoad(Builder.getInt8Ty(), charPtr);
-    Value *isNull = Builder.CreateICmpEQ(ch, ConstantInt::get(Context, APInt(8, 0)));
-    Builder.CreateCondBr(isNull, StrlenDoneBB, StrlenBodyBB);
-
-    // Body: increment index and jump back to condition
-    Builder.SetInsertPoint(StrlenBodyBB);
-    Value *nextLen = Builder.CreateAdd(curLen, ConstantInt::get(Context, APInt(32, 1)));
-    Builder.CreateStore(nextLen, lenIdx);
-    Builder.CreateBr(StrlenCondBB);
-
-    // Done: store final length and jump to post-strlen block
-    Builder.SetInsertPoint(StrlenDoneBB);
-    Value *finalLen = Builder.CreateLoad(Builder.getInt32Ty(), lenIdx);
-    Builder.CreateStore(finalLen, StrLenAlloca);
     Builder.CreateBr(PostStrlenBB);
-    // Ensure strlen_done has a terminator (defensive).
-    ensureBlockHasTerminator(StrlenDoneBB, PostStrlenBB);
     
     // Create return blocks (reusable)
     BasicBlock *ReturnFailBB = BasicBlock::Create(Context, "return_fail", MatchF);
@@ -773,19 +754,22 @@ Value* Func::CodeGen() {
             
             RJDBG(std::cerr << "Using BMH optimization for literal: " << literalPrefix << "\n");
             
-            // Declare regjit_bmh_search: const char* regjit_bmh_search(
-            //     const char* haystack, size_t haystacklen,
-            //     const char* needle, size_t needlelen)
-            FunctionCallee bmhFn = ThisModule->getOrInsertFunction("regjit_bmh_search",
-                FunctionType::get(i8ptrTy, {i8ptrTy, sizeTy, i8ptrTy, sizeTy}, false));
+            // Get the function type for regjit_bmh_search
+            FunctionType* bmhFnTy = FunctionType::get(i8ptrTy, {i8ptrTy, sizeTy, i8ptrTy, sizeTy}, false);
+            
+            // Create function pointer by embedding the address directly
+            // This avoids symbol lookup overhead at runtime
+            auto bmhAddr = reinterpret_cast<uintptr_t>(&regjit_bmh_search);
+            Value* bmhPtrInt = ConstantInt::get(Builder.getInt64Ty(), bmhAddr);
+            Value* bmhPtr = Builder.CreateIntToPtr(bmhPtrInt, PointerType::get(bmhFnTy, 0));
             
             // Create a global string constant for the needle
             Value* needlePtr = Builder.CreateGlobalStringPtr(literalPrefix, "needle");
             Value* needleLen = ConstantInt::get(sizeTy, literalPrefix.length());
             
-            // Call regjit_bmh_search(Arg0, strlen, needle, needlelen)
+            // Call regjit_bmh_search(Arg0, strlen, needle, needlelen) via function pointer
             Value* haystackLen = Builder.CreateZExt(strlenVal, sizeTy);
-            Value* foundPtr = Builder.CreateCall(bmhFn, {Arg0, haystackLen, needlePtr, needleLen});
+            Value* foundPtr = Builder.CreateCall(bmhFnTy, bmhPtr, {Arg0, haystackLen, needlePtr, needleLen});
             
             // Check if BMH found anything (returns nullptr if not found)
             Value* isNull = Builder.CreateICmpEQ(foundPtr, ConstantPointerNull::get(cast<PointerType>(i8ptrTy)));
