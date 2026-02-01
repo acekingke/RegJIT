@@ -1,201 +1,204 @@
-#  🚀  Regular Expression JIT Compiler
-This JIT compiler demonstrates **over 60x speedup** compared to C++'s std::regex through LLVM-based optimizations.
+# 🚀 RegJIT - Regular Expression JIT Compiler
 
-Key optimizations:
-1. **Native machine code generation** avoids interpretation overhead
-2. **Pattern-specific optimization** eliminates generic regex costs
-3. **LLVM pipeline** applies target-specific optimizations
-4. **Zero-copy matching** reduces memory operations
+A high-performance regex engine that compiles regular expressions to native machine code using LLVM, achieving **up to 231x speedup** over C++'s `std::regex`.
 
-## 🛠️ Prerequisites
+## 📊 Performance Results
+
+Benchmark results comparing RegJIT vs `std::regex` (compiled with `-O3`):
+
+| Test Case | Pattern | JIT (ns) | std::regex (ns) | Speedup |
+|-----------|---------|----------|-----------------|---------|
+| Character class | `[a-zA-Z0-9]+` | 8 | 1848 | **231x** |
+| Nested groups | `(a(b(c)+)+)+` | 7 | 1618 | **231x** |
+| Word chars | `\w+` | 6 | 1164 | **194x** |
+| Digits | `\d+` | 5 | 884 | **177x** |
+| Alternation | `cat\|dog\|bird` | 10 | 1511 | **151x** |
+| Email pattern | `[a-z]+@[a-z]+\.[a-z]+` | 38 | 5248 | **138x** |
+| IP pattern | `\d+\.\d+\.\d+\.\d+` | 18 | 1944 | **108x** |
+| Whitespace | `\s+` | 6 | 587 | **98x** |
+| Plus quantifier | `a+` (1000 chars) | 609 | 56779 | **93x** |
+| Star quantifier | `a*` (1000 chars) | 668 | 56938 | **85x** |
+| Long input search | `needle` (10K chars) | 5902 | 354027 | **60x** |
+
+**Average Speedup: 94.9x**
+
+## ✨ Key Features
+
+- **Native Machine Code**: Compiles regex patterns directly to CPU instructions
+- **LLVM Optimization**: Leverages LLVM's O2 optimization pipeline
+- **Pattern-Specific Code**: Each pattern gets its own optimized binary
+- **Zero-Copy Matching**: Direct pointer manipulation without memory allocation
+- **Python Bindings**: Full Python 3.12 integration with caching
+
+## 🛠️ Supported Syntax
+
+| Feature | Syntax | Example |
+|---------|--------|---------|
+| Literals | `abc` | `hello` |
+| Quantifiers | `*`, `+`, `?`, `{n}`, `{n,}`, `{n,m}` | `a+`, `b{2,5}` |
+| Character classes | `[abc]`, `[a-z]`, `[^0-9]` | `[a-zA-Z0-9_]+` |
+| Dot wildcard | `.` | `a.b` |
+| Alternation | `\|` | `cat\|dog` |
+| Grouping | `(...)` | `(ab)+` |
+| Anchors | `^`, `$`, `\b`, `\B` | `^hello$` |
+| Escape sequences | `\d`, `\D`, `\w`, `\W`, `\s`, `\S` | `\d+\.\d+` |
+| Special chars | `\t`, `\n`, `\r` | `line\nbreak` |
+
+## 📥 Prerequisites
+
 - LLVM 19+ (with development headers)
-- Modern C++17 compiler (GCC 10+/Clang 12+/MSVC 2019+)
-- CMake 3.15+
+- C++17 compiler (GCC 10+ / Clang 12+ / MSVC 2019+)
+- Python 3.12 (for Python bindings)
 
-## 📥 LLVM Installation
+### LLVM Installation
 
-### Ubuntu/Debian
+**Ubuntu/Debian:**
 ```bash
 wget https://apt.llvm.org/llvm.sh
 chmod +x llvm.sh
 sudo ./llvm.sh 19
-sudo apt-get install llvm-19-dev libclang-19-dev
+sudo apt-get install llvm-19-dev
 ```
 
-### macOS (Homebrew)
+**macOS (Homebrew):**
 ```bash
 brew install llvm@19
-echo 'export PATH="/opt/homebrew/opt/llvm@19/bin:$PATH"' >> ~/.zshrc
-source ~/.zshrc
-```
-
-### Windows (vcpkg)
-```powershell
-vcpkg install llvm:x64-windows
+export PATH="/opt/homebrew/opt/llvm@19/bin:$PATH"
 ```
 
 ## 🔧 Build Instructions
+
 ```bash
-# Configure project
-mkdir build && cd build
-cmake .. -DLLVM_DIR=/path/to/llvm-config.cmake  # e.g. /usr/lib/llvm-13/lib/cmake/llvm
+# Build with optimizations (recommended for benchmarks)
+make RELEASE=1 bench
 
-# Build executable
-make -j$(nproc)
+# Build tests
+make test_all
 
-# Output binary: build/regjit
+# Build Python bindings
+make libregjit.so
+make python-bindings
 ```
 
-## 🧪 sample
-The sample give a sample about how to use it.
-```bash
-# Run sample
-make clean && make sample
-./sample
+### Build Options
 
-# Expected output:
-[Test Pattern] a+b*
-- Test 'aaab' : ✅ Match
-- Test 'abb'  : ❌ No match
-- Test 'b'    : ✅ Match
-```
-## 🧪 test
-```bash
-# Run sample
-make clean && make test
-./test
-./test 
+| Option | Description |
+|--------|-------------|
+| `RELEASE=1` | Optimized build with `-O3` (recommended for benchmarks) |
+| `REGJIT_DEBUG=1` | Enable IR dump and diagnostic output |
 
-Generated LLVM IR:
-; ModuleID = 'my_module'
-source_filename = "my_module"
+## 🧪 Usage
 
-define i32 @match(ptr %Arg0) {
-entry:
-  %0 = alloca i32, align 4
-  store i32 0, ptr %0, align 4
-  %1 = alloca i32, align 4
-  store i32 0, ptr %1, align 4
-  br label %repeat_check
+### C++ API
 
-TrueBlock:                                        ; preds = %repeat_exit
-  %2 = load i32, ptr %0, align 4
-  %3 = add i32 %2, 1
-  %4 = call i32 @strlen(ptr %Arg0)
-  %5 = icmp eq i32 %3, %4
-  br i1 %5, label %real_true, label %FalseBlock
+```cpp
+#include "regjit.h"
 
-FalseBlock:                                       ; preds = %TrueBlock, %repeat_loop
-  ret i32 0
-
-repeat_check:                                     ; preds = %repeat_success, %entry
-  %6 = load i32, ptr %1, align 4
-  %7 = icmp slt i32 %6, 3
-  br i1 %7, label %repeat_loop, label %repeat_exit
-
-repeat_loop:                                      ; preds = %repeat_check
-  %8 = load i32, ptr %0, align 4
-  %9 = getelementptr i8, ptr %Arg0, i32 %8
-  %10 = load i8, ptr %9, align 1
-  %11 = icmp ne i8 %10, 99
-  br i1 %11, label %FalseBlock, label %repeat_success
-
-repeat_success:                                   ; preds = %repeat_loop
-  %12 = load i32, ptr %0, align 4
-  %13 = add i32 %12, 1
-  store i32 %13, ptr %0, align 4
-  %14 = add i32 %6, 1
-  store i32 %14, ptr %1, align 4
-  br label %repeat_check
-
-repeat_exit:                                      ; preds = %repeat_check
-  %15 = load i32, ptr %0, align 4
-  %16 = sub i32 %15, 1
-  store i32 %16, ptr %0, align 4
-  br label %TrueBlock
-
-real_true:                                        ; preds = %TrueBlock
-  ret i32 1
+int main() {
+    Initialize();
+    
+    // Compile and execute
+    if (CompileRegex("hello|world")) {
+        auto sym = ExitOnErr(JIT->lookup(FunctionName));
+        auto match = (int (*)(const char*))sym.getValue();
+        
+        printf("Match: %d\n", match("hello there"));  // 1
+        printf("Match: %d\n", match("goodbye"));      // 0
+    }
+    
+    CleanUp();
+    return 0;
 }
-
-declare i32 @strlen(ptr)
-
-Program exited with code: 1
-
-Program exited with code: 0
-
-Program exited with code: 0
-
-Program exited with code: 0
 ```
 
-## 🧠 Architecture Overview
-1. **LLVM JIT Core**  
-   Uses ORC JIT API for dynamic code generation
-   - Custom optimization pipeline
-   - Architecture-specific code generation
+### Python API
 
+```python
+import sys
+sys.path.insert(0, 'python')
+from _regjit import Regex
 
-## 📊 Performance Metrics
- **Over 60 times speedup**
+# Compile and match
+r = Regex(r'\d+\.\d+')
+print(r.match('3.14'))      # True
+print(r.match('hello'))     # False
+
+# Pattern caching
+import _regjit
+print(_regjit.cache_size())  # Number of cached patterns
+```
+
+## 📈 Running Benchmarks
+
 ```bash
-./bench 
+# Build optimized benchmark
+make clean && make RELEASE=1 bench
 
-Testing a{1000} on 1000 chars:
-
-Generated LLVM IR:
-; ModuleID = 'my_module'
-source_filename = "my_module"
-
-define i32 @match(ptr %Arg0) {
-entry:
-  %0 = alloca i32, align 4
-  store i32 0, ptr %0, align 4
-  %1 = alloca i32, align 4
-  store i32 0, ptr %1, align 4
-  br label %repeat_check
-
-TrueBlock:                                        ; preds = %repeat_exit
-  %2 = load i32, ptr %0, align 4
-  %3 = add i32 %2, 1
-  %4 = call i32 @strlen(ptr %Arg0)
-  %5 = icmp eq i32 %3, %4
-  br i1 %5, label %real_true, label %FalseBlock
-
-FalseBlock:                                       ; preds = %TrueBlock, %repeat_loop
-  ret i32 0
-
-repeat_check:                                     ; preds = %repeat_success, %entry
-  %6 = load i32, ptr %1, align 4
-  %7 = icmp slt i32 %6, 1000
-  br i1 %7, label %repeat_loop, label %repeat_exit
-
-repeat_loop:                                      ; preds = %repeat_check
-  %8 = load i32, ptr %0, align 4
-  %9 = getelementptr i8, ptr %Arg0, i32 %8
-  %10 = load i8, ptr %9, align 1
-  %11 = icmp ne i8 %10, 97
-  br i1 %11, label %FalseBlock, label %repeat_success
-
-repeat_success:                                   ; preds = %repeat_loop
-  %12 = load i32, ptr %0, align 4
-  %13 = add i32 %12, 1
-  store i32 %13, ptr %0, align 4
-  %14 = add i32 %6, 1
-  store i32 %14, ptr %1, align 4
-  br label %repeat_check
-
-repeat_exit:                                      ; preds = %repeat_check
-  %15 = load i32, ptr %0, align 4
-  %16 = sub i32 %15, 1
-  store i32 %16, ptr %0, align 4
-  br label %TrueBlock
-
-real_true:                                        ; preds = %TrueBlock
-  ret i32 1
-}
-
-declare i32 @strlen(ptr)
-JIT time (1000): 375 ns/iter
-std::regex time (1000): 26185 ns/iter (Speedup: 69x)
+# Run benchmark
+./bench
 ```
+
+Example output:
+```
+====================================================================================================
+                           RegJIT vs std::regex Benchmark Results
+====================================================================================================
+Test Case                Pattern                 JIT (ns)     std::regex     Speedup
+----------------------------------------------------------------------------------------------------
+Simple literal           hello                          9            137      15.2x
+Char class [a-zA-Z0-9]+  [a-zA-Z0-9]+                   8           1848     231.0x
+Digit \d+                \d+                            5            884     176.8x
+Email-like pattern       [a-z]+@[a-z]+\.[a-z]+          38           5248     138.1x
+...
+----------------------------------------------------------------------------------------------------
+Average Speedup:                                                                        94.9x
+====================================================================================================
+```
+
+## 🧠 Architecture
+
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│   Pattern   │ ──▶ │   Parser    │ ──▶ │     AST     │ ──▶ │  LLVM IR    │
+│   String    │     │   (Lexer)   │     │   Nodes     │     │  CodeGen    │
+└─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
+                                                                   │
+                                                                   ▼
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│   Execute   │ ◀── │   Native    │ ◀── │  LLVM ORC   │ ◀── │  Optimize   │
+│   Match()   │     │   Code      │     │    JIT      │     │    (O2)     │
+└─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
+```
+
+### Core Components
+
+1. **Lexer/Parser**: Tokenizes and parses regex patterns into AST
+2. **AST Nodes**: `Match`, `Concat`, `Alternative`, `Repeat`, `CharClass`, `Anchor`
+3. **CodeGen**: Generates LLVM IR from AST with control flow optimization
+4. **JIT Compiler**: LLVM ORC JIT compiles IR to native machine code
+5. **Cache**: LRU cache for compiled patterns with reference counting
+
+## 🧪 Testing
+
+```bash
+# Run all tests
+make test_all
+
+# Run specific tests
+make test_anchor && ./test_anchor
+make test_charclass && ./test_charclass
+make test_quantifier && ./test_quantifier
+make test_escape && ./test_escape
+make test_syntax && ./test_syntax
+
+# Run Python tests
+cd python/tests && python3.12 test_bindings.py
+```
+
+## 📄 License
+
+MIT License
+
+## 🤝 Contributing
+
+Contributions are welcome! Please feel free to submit issues and pull requests.
