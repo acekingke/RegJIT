@@ -86,6 +86,9 @@ public:
     virtual std::string getLiteralPrefix() const { return ""; }
     // Returns true if this node is a pure literal (only Match nodes, no special chars)
     virtual bool isPureLiteral() const { return false; }
+    // Returns the single character if this is a simple Match node, -1 otherwise
+    // Used for optimizing patterns like a+, b*, etc.
+    virtual int getSingleChar() const { return -1; }
     void SetFailBlock(BasicBlock *b) {
       failBlock = b;
     }
@@ -118,6 +121,7 @@ public:
      int getFirstLiteralChar() const override { return static_cast<unsigned char>(choice); }
      std::string getLiteralPrefix() const override { return std::string(1, choice); }
      bool isPureLiteral() const override { return true; }
+     int getSingleChar() const override { return static_cast<unsigned char>(choice); }
       ~Match() override = default; 
   };
   class Concat: public Root{

@@ -154,6 +154,41 @@ extern "C" const char* regjit_bmh_search(const char* haystack, size_t haystackLe
     return nullptr;  // Not found
 }
 
+// Count consecutive occurrences of a character starting from pos.
+// Uses memchr to find the first non-matching character efficiently.
+// Returns the count of consecutive matching characters.
+extern "C" size_t regjit_count_char(const char* str, size_t len, char target) {
+    if (len == 0) return 0;
+    
+    // Find the first character that is NOT the target
+    // We scan byte by byte until we find a non-match
+    // Note: there's no "memchr_not" in libc, but we can use a simple loop
+    // that the compiler will often vectorize, or scan in chunks
+    
+    size_t count = 0;
+    
+    // For very long runs, process in chunks to help vectorization
+    // Check 8 bytes at a time when possible
+    while (count + 8 <= len) {
+        if (str[count] != target) return count;
+        if (str[count + 1] != target) return count + 1;
+        if (str[count + 2] != target) return count + 2;
+        if (str[count + 3] != target) return count + 3;
+        if (str[count + 4] != target) return count + 4;
+        if (str[count + 5] != target) return count + 5;
+        if (str[count + 6] != target) return count + 6;
+        if (str[count + 7] != target) return count + 7;
+        count += 8;
+    }
+    
+    // Handle remaining bytes
+    while (count < len && str[count] == target) {
+        count++;
+    }
+    
+    return count;
+}
+
 // NOTE: previous attempts to defensively create new blocks when the current
 // insert block already had a terminator caused verifier failures because some
 // of those helper-created blocks remained empty (no terminator). Instead of
@@ -1010,6 +1045,53 @@ Value* Repeat::CodeGen() {
             // After trying, go to success
             Builder.SetInsertPoint(afterBlock);
             Builder.CreateBr(GetSuccessBlock());
+            return nullptr;
+        }
+        
+        // === FAST PATH: Single character repeat (a+, a*, b+, etc.) ===
+        // Use regjit_count_char to count consecutive matching chars in one call
+        int singleChar = Body->getSingleChar();
+        if (singleChar >= 0 && !nonGreedy) {
+            // Fast path for greedy single-char quantifiers
+            RJDBG(std::cerr << "Using fast path for single-char repeat: " << (char)singleChar << (isPlus ? "+" : "*") << "\n");
+            
+            Type* i8ptrTy = PointerType::get(Builder.getInt8Ty(), 0);
+            Type* sizeTy = Builder.getInt64Ty();
+            
+            // Declare regjit_count_char: size_t regjit_count_char(const char* str, size_t len, char target)
+            FunctionCallee countFn = ThisModule->getOrInsertFunction("regjit_count_char",
+                FunctionType::get(sizeTy, {i8ptrTy, sizeTy, Builder.getInt8Ty()}, false));
+            
+            // Get current position and remaining length
+            Value* curIdx = Builder.CreateLoad(intTy, Index);
+            Value* strLen = Builder.CreateLoad(intTy, StrLenAlloca);
+            Value* remaining = Builder.CreateSub(strLen, curIdx);
+            Value* remainingSize = Builder.CreateZExt(remaining, sizeTy);
+            
+            // Get pointer to current position
+            Value* curPtr = Builder.CreateGEP(Builder.getInt8Ty(), Arg0, {curIdx});
+            
+            // Call regjit_count_char(curPtr, remaining, targetChar)
+            Value* targetChar = ConstantInt::get(Builder.getInt8Ty(), singleChar);
+            Value* count = Builder.CreateCall(countFn, {curPtr, remainingSize, targetChar});
+            Value* count32 = Builder.CreateTrunc(count, intTy);
+            
+            if (isPlus) {
+                // Plus: must match at least one
+                Value* isZero = Builder.CreateICmpEQ(count32, ConstantInt::get(intTy, 0));
+                BasicBlock* successBlock = BasicBlock::Create(Context, "repeat_fast_success", MatchF);
+                Builder.CreateCondBr(isZero, GetFailBlock(), successBlock);
+                
+                Builder.SetInsertPoint(successBlock);
+                Value* newIdx = Builder.CreateAdd(curIdx, count32);
+                Builder.CreateStore(newIdx, Index);
+                Builder.CreateBr(GetSuccessBlock());
+            } else {
+                // Star: zero or more is always ok
+                Value* newIdx = Builder.CreateAdd(curIdx, count32);
+                Builder.CreateStore(newIdx, Index);
+                Builder.CreateBr(GetSuccessBlock());
+            }
             return nullptr;
         }
         
