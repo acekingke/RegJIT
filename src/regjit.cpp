@@ -1146,6 +1146,65 @@ Value* Repeat::CodeGen() {
         Builder.CreateBr(GetSuccessBlock());
         return nullptr;
     }
+    
+    // === FAST PATH: Single character exact/range repeat (a{n}, a{n,m}) ===
+    // For patterns like a{1000}, use regjit_count_char instead of looping
+    int singleChar = Body->getSingleChar();
+    bool isExactRepeat = (minCount == maxCount && minCount > 0);
+    bool isRangeRepeat = (minCount >= 0 && maxCount > minCount);
+    bool isMinOnlyRepeat = (minCount > 0 && maxCount == -1);  // a{n,}
+    
+    if (singleChar >= 0 && !nonGreedy && (isExactRepeat || isRangeRepeat || isMinOnlyRepeat)) {
+        RJDBG(std::cerr << "Using fast path for char repeat: " << (char)singleChar << "{" << minCount << "," << maxCount << "}\n");
+        
+        Type* i8ptrTy = PointerType::get(Builder.getInt8Ty(), 0);
+        Type* sizeTy = Builder.getInt64Ty();
+        
+        // Declare regjit_count_char
+        FunctionCallee countFn = ThisModule->getOrInsertFunction("regjit_count_char",
+            FunctionType::get(sizeTy, {i8ptrTy, sizeTy, Builder.getInt8Ty()}, false));
+        
+        // Get current position and remaining length
+        Value* curIdx = Builder.CreateLoad(intTy, Index);
+        Value* strLen = Builder.CreateLoad(intTy, StrLenAlloca);
+        Value* remaining = Builder.CreateSub(strLen, curIdx);
+        Value* remainingSize = Builder.CreateZExt(remaining, sizeTy);
+        
+        // Get pointer to current position
+        Value* curPtr = Builder.CreateGEP(Builder.getInt8Ty(), Arg0, {curIdx});
+        
+        // Call regjit_count_char
+        Value* targetChar = ConstantInt::get(Builder.getInt8Ty(), singleChar);
+        Value* count = Builder.CreateCall(countFn, {curPtr, remainingSize, targetChar});
+        Value* count32 = Builder.CreateTrunc(count, intTy);
+        
+        // Check minimum requirement
+        Value* minVal = ConstantInt::get(intTy, minCount);
+        Value* hasEnough = Builder.CreateICmpSGE(count32, minVal);
+        
+        BasicBlock* successBlock = BasicBlock::Create(Context, "repeat_range_success", MatchF);
+        Builder.CreateCondBr(hasEnough, successBlock, GetFailBlock());
+        
+        Builder.SetInsertPoint(successBlock);
+        
+        // Calculate how many to consume (greedy: consume up to max, or all if unbounded)
+        Value* consumed;
+        if (maxCount == -1) {
+            // a{n,} - consume all matched
+            consumed = count32;
+        } else {
+            // a{n,m} or a{n} - consume min(count, max)
+            Value* maxVal = ConstantInt::get(intTy, maxCount);
+            Value* useMax = Builder.CreateICmpSGT(count32, maxVal);
+            consumed = Builder.CreateSelect(useMax, maxVal, count32);
+        }
+        
+        Value* newIdx = Builder.CreateAdd(curIdx, consumed);
+        Builder.CreateStore(newIdx, Index);
+        Builder.CreateBr(GetSuccessBlock());
+        return nullptr;
+    }
+    
     // 允许范围（如 {2,5} 或 {3,} ）
     int minR = minCount < 0 ? 0 : minCount;
     int maxR = maxCount;
