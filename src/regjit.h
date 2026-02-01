@@ -78,6 +78,9 @@ public:
     // Returns true if the subtree contains a Repeat whose body is zero-width
     // (e.g. repeating an anchor). Conservative default: false.
     virtual bool containsZeroWidthRepeat() const { return false; }
+    // Returns the first literal character if the pattern starts with a literal
+    // Returns -1 if not applicable (e.g., starts with anchor, char class, etc.)
+    virtual int getFirstLiteralChar() const { return -1; }
     void SetFailBlock(BasicBlock *b) {
       failBlock = b;
     }
@@ -107,6 +110,7 @@ public:
      explicit Match(char x) :choice(x){}
       
      Value* CodeGen() override;
+     int getFirstLiteralChar() const override { return static_cast<unsigned char>(choice); }
       ~Match() override = default; 
   };
   class Concat: public Root{
@@ -117,6 +121,14 @@ public:
     Value* CodeGen() override;
     bool isAnchoredAtStart() const override;
     bool containsZeroWidthRepeat() const override;
+    int getFirstLiteralChar() const override {
+      // Skip zero-width elements (anchors) and return first literal
+      for (const auto& child : BodyVec) {
+        if (child->isZeroWidth()) continue;
+        return child->getFirstLiteralChar();
+      }
+      return -1;
+    }
   };
   
   class Alternative: public Root{
