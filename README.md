@@ -1,34 +1,46 @@
 # 🚀 RegJIT - Regular Expression JIT Compiler
 
-A high-performance regex engine that compiles regular expressions to native machine code using LLVM, achieving **up to 231x speedup** over C++'s `std::regex`.
+A high-performance regex engine that compiles regular expressions to native machine code using LLVM, achieving **up to 1031x speedup** over C++'s `std::regex` and **up to 8.5x speedup** over PCRE2-JIT.
 
 ## 📊 Performance Results
 
-Benchmark results comparing RegJIT vs `std::regex` (compiled with `-O3`):
+Benchmark results comparing RegJIT vs `std::regex` vs PCRE2-JIT (compiled with `-O3`, 10K iterations):
 
-| Test Case | Pattern | JIT (ns) | std::regex (ns) | Speedup |
-|-----------|---------|----------|-----------------|---------|
-| Character class | `[a-zA-Z0-9]+` | 8 | 1848 | **231x** |
-| Nested groups | `(a(b(c)+)+)+` | 7 | 1618 | **231x** |
-| Word chars | `\w+` | 6 | 1164 | **194x** |
-| Digits | `\d+` | 5 | 884 | **177x** |
-| Alternation | `cat\|dog\|bird` | 10 | 1511 | **151x** |
-| Email pattern | `[a-z]+@[a-z]+\.[a-z]+` | 38 | 5248 | **138x** |
-| IP pattern | `\d+\.\d+\.\d+\.\d+` | 18 | 1944 | **108x** |
-| Whitespace | `\s+` | 6 | 587 | **98x** |
-| Plus quantifier | `a+` (1000 chars) | 609 | 56779 | **93x** |
-| Star quantifier | `a*` (1000 chars) | 668 | 56938 | **85x** |
-| Long input search | `needle` (10K chars) | 5902 | 354027 | **60x** |
+| Test Case | Pattern | RegJIT (ns) | std::regex (ns) | PCRE2-JIT (ns) | vs std | vs PCRE2 |
+|-----------|---------|-------------|-----------------|----------------|--------|----------|
+| Plus quantifier | `a+` | 55 | 56,759 | 346 | **1031x** | **6.3x** |
+| Star quantifier | `a*` | 59 | 56,705 | 317 | **961x** | **5.4x** |
+| Long input (10KB) | `needle` | 434 | 351,682 | 291 | **810x** | 0.67x |
+| Char class | `[a-zA-Z0-9]+` | 3 | 1,935 | 22 | **645x** | **7.3x** |
+| Word chars | `\w+` | 2 | 1,255 | 17 | **628x** | **8.5x** |
+| Digits | `\d+` | 2 | 939 | 15 | **470x** | **7.5x** |
+| Whitespace | `\s+` | 2 | 664 | 14 | **332x** | **7.0x** |
+| Char class | `[a-z]+` | 2 | 442 | 12 | **221x** | **6.0x** |
+| Negated class | `[^0-9]+` | 2 | 416 | 13 | **208x** | **6.5x** |
+| Email pattern | `[a-z]+@[a-z]+\.[a-z]+` | 27 | 5,325 | 23 | **197x** | 0.85x |
+| Alternation | `cat\|dog\|bird` | 8 | 1,534 | 14 | **192x** | **1.8x** |
+| IP pattern | `\d+\.\d+\.\d+\.\d+` | 11 | 2,020 | 24 | **184x** | **2.2x** |
+| Nested groups | `(a(b(c)+)+)+` | 12 | 1,624 | 40 | **135x** | **3.3x** |
+| Exact repeat | `a{1000}` | 87 | 8,296 | 323 | **95x** | **3.7x** |
 
-**Average Speedup: 94.9x**
+**Average Speedup: 317x vs std::regex, 3.9x vs PCRE2-JIT**
+
+### Key Optimizations
+
+- **Boyer-Moore-Horspool**: Custom string search algorithm (replaces slow macOS `memmem`)
+- **ARM NEON SIMD**: Vectorized character counting for `a+`, `a*`, `a{n}` patterns
+- **Direct Function Pointers**: Embedded libc calls (strlen, memchr) avoid symbol lookup
+- **Fast Paths**: Single-char quantifiers use optimized counting instead of loops
 
 ## ✨ Key Features
 
 - **Native Machine Code**: Compiles regex patterns directly to CPU instructions
 - **LLVM Optimization**: Leverages LLVM's O2 optimization pipeline
+- **SIMD Acceleration**: ARM NEON vectorized character counting
+- **Boyer-Moore-Horspool**: Fast string search for literal patterns
 - **Pattern-Specific Code**: Each pattern gets its own optimized binary
 - **Zero-Copy Matching**: Direct pointer manipulation without memory allocation
-- **Python Bindings**: Full Python 3.12 integration with caching
+- **Python Bindings**: Full Python 3.12 integration with LRU caching
 
 ## 🛠️ Supported Syntax
 
@@ -131,7 +143,7 @@ print(_regjit.cache_size())  # Number of cached patterns
 ## 📈 Running Benchmarks
 
 ```bash
-# Build optimized benchmark
+# Build optimized benchmark (requires PCRE2)
 make clean && make RELEASE=1 bench
 
 # Run benchmark
@@ -140,19 +152,21 @@ make clean && make RELEASE=1 bench
 
 Example output:
 ```
-====================================================================================================
-                           RegJIT vs std::regex Benchmark Results
-====================================================================================================
-Test Case                Pattern                 JIT (ns)     std::regex     Speedup
-----------------------------------------------------------------------------------------------------
-Simple literal           hello                          9            137      15.2x
-Char class [a-zA-Z0-9]+  [a-zA-Z0-9]+                   8           1848     231.0x
-Digit \d+                \d+                            5            884     176.8x
-Email-like pattern       [a-z]+@[a-z]+\.[a-z]+          38           5248     138.1x
+========================================================================================================================
+                         RegJIT vs std::regex vs PCRE2 (JIT) Benchmark Results
+========================================================================================================================
+Test Case             Pattern             RegJIT(ns)    std::regex     PCRE2-JIT        vs std      vs PCRE2
+------------------------------------------------------------------------------------------------------------------------
+Plus quantifier a+    a+                          55         56759           346       1031.98x        6.29x
+Star quantifier a*    a*                          59         56705           317        961.10x        5.37x
+Long input search     needle                     434        351682           291        810.33x        0.67x
+Char class [a-zA-Z0-9]+[a-zA-Z0-9]+                 3          1935            22        645.00x        7.33x
+Word \w+              \w+                          2          1255            17        627.50x        8.50x
+Digit \d+             \d+                          2           939            15        469.50x        7.50x
 ...
-----------------------------------------------------------------------------------------------------
-Average Speedup:                                                                        94.9x
-====================================================================================================
+------------------------------------------------------------------------------------------------------------------------
+Average Speedup:                                                                        316.90x        3.91x
+========================================================================================================================
 ```
 
 ## 🧠 Architecture
