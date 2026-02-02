@@ -2124,6 +2124,19 @@ Value* Anchor::CodeGen() {
     return nullptr;
 }
 
+// Not operator implementation (negation of a subpattern)
+// Note: This is a placeholder - the Not class is declared but not currently
+// used by the parser. If you need negative lookahead or similar features,
+// implement the actual logic here.
+Value* Not::CodeGen() {
+    // For now, just generate the body and invert the result
+    // This is a stub implementation to satisfy the linker
+    if (Body) {
+        Body->CodeGen();
+    }
+    return nullptr;
+}
+
 // --- AST property helpers ---
 bool Anchor::isAnchoredAtStart() const {
     return anchorType == Anchor::Start;
