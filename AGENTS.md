@@ -594,6 +594,68 @@ Value* strlenResult = Builder.CreateCall(
 3. **SIMD 兼容**：新的 SIMD 优化必须提供标量回退
 4. **函数指针嵌入**：对于频繁调用的辅助函数，使用直接指针嵌入而非符号查找
 
+### ⚠️ 构建验证要求（必须遵守）
+
+**在提交任何代码改动之前，必须验证所有编译开关都能正常工作：**
+
+```bash
+# 1. 普通构建 + 测试
+make clean && make test_all
+
+# 2. Release 构建 + 测试
+make clean && make RELEASE=1 test_all
+
+# 3. Debug 构建 + 测试（带 IR 输出）
+make clean && make REGJIT_DEBUG=1 test_all
+
+# 4. Release + Debug 构建
+make clean && make RELEASE=1 REGJIT_DEBUG=1 test_all
+```
+
+#### 常见构建问题
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| `undefined symbol: typeinfo for Xxx` | 类声明了虚函数但未在 .cpp 中实现 | 在 regjit.cpp 中添加实现 |
+| `REGJIT_DEBUG=1` 编译失败 | `dynamic_cast` 需要 RTTI，RTTI 需要虚函数定义 | 确保所有 AST 类的 `CodeGen()` 都有实现 |
+| 链接错误 | 头文件中声明但未定义的函数 | 检查所有虚函数是否有实现 |
+
+#### 案例：Not::CodeGen() 缺失
+
+**问题**：`Not` 类在 `regjit.h` 中声明，但 `Not::CodeGen()` 从未在 `regjit.cpp` 中实现。普通构建正常，但 `REGJIT_DEBUG=1` 构建失败：
+
+```
+Undefined symbols for architecture arm64:
+  "typeinfo for Not", referenced from:
+      CompileRegex(...)::$_0::operator()(Root*, int) const in regjit.o
+```
+
+**原因**：
+- 调试代码中有 `dynamic_cast<Not*>(r)` 调用
+- `dynamic_cast` 需要 RTTI (Run-Time Type Information)
+- RTTI 需要至少一个虚函数在 .cpp 文件中定义来锚定 vtable
+
+**解决方案**：添加 `Not::CodeGen()` 的存根实现：
+
+```cpp
+// src/regjit.cpp
+Value* Not::CodeGen() {
+    if (Body) {
+        Body->CodeGen();
+    }
+    return nullptr;
+}
+```
+
+#### 验证清单
+
+在提交前，确保以下所有命令都成功：
+
+- [ ] `make clean && make test_all` - 普通构建
+- [ ] `make clean && make RELEASE=1 test_quick` - Release 构建
+- [ ] `make clean && make REGJIT_DEBUG=1 test_all` - Debug 构建
+- [ ] `make RELEASE=1 bench && ./bench` - 性能基准测试
+
 ### 🐛 性能调试技巧
 
 #### 隔离性能问题
