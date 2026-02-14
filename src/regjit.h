@@ -156,7 +156,9 @@ public:
     }
     bool isPureLiteral() const override {
       for (const auto& child : BodyVec) {
-        if (child->isZeroWidth()) continue;
+        // Zero-width nodes (anchors, etc.) have semantic meaning, so patterns
+        // containing them are NOT pure literals
+        if (child->isZeroWidth()) return false;
         if (!child->isPureLiteral()) return false;
       }
       return true;

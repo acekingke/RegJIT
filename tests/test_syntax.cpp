@@ -94,8 +94,11 @@ void test_unclosed_brace() {
 
 void test_empty_group() {
     std::cout << "Testing empty group..." << std::endl;
+    // Python re allows () — it matches the empty string
     Initialize();
-    assert(!CompileRegex("()") && "() should fail to compile (unbalanced parenthesis)");
+    assert(CompileRegex("()") && "() should compile (matches empty string, per Python re)");
+    assert(Execute("hello") == 1 && "() should match any input (empty match)");
+    assert(Execute("") == 1 && "() should match empty input");
     CleanUp();
 
     std::cout << "  test_empty_group passed" << std::endl;

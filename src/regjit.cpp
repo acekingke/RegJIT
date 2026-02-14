@@ -64,6 +64,10 @@
   Value *Index;
   Value *Arg0;
   Value *StrLenAlloca = nullptr;
+  // Match position tracking for Python re compatibility
+  Value *MatchStartAlloca = nullptr;  // Stores the start position of current match attempt
+  Value *StartOutArg = nullptr;       // Output parameter for match start
+  Value *EndOutArg = nullptr;         // Output parameter for match end
   
 
 void Initialize() {
@@ -492,49 +496,88 @@ int regjit_compile(const char* pattern, char** err_msg) {
   }
 }
 
+// Helper to execute compiled pattern
+static regjit_match_result execute_jit_func(const char* pattern, const char* buf, size_t len) {
+    regjit_match_result res = {0, -1, -1};
+    
+    // Ensure null termination
+    bool need_copy = false;
+    if (len == 0 || buf[len-1] != '\0') need_copy = true;
+    std::string tmp;
+    const char* cstr = nullptr;
+    if (need_copy) {
+        tmp.assign(buf, len);
+        tmp.push_back('\0');
+        cstr = tmp.c_str();
+    } else {
+        cstr = buf;
+    }
+    
+    if (!pattern) {
+        res.matched = -1;
+        return res;
+    }
+
+    // Acquire the compiled pattern to ensure it isn't evicted while executing
+    char* err = nullptr;
+    if (!regjit_acquire(pattern, &err)) {
+        if (err) free(err);
+        res.matched = -1;
+        return res;
+    }
+
+    // Find the compiled entry and call its function pointer (Addr)
+    uint64_t addr = 0;
+    {
+        std::lock_guard<std::mutex> lk(CompileCacheMutex);
+        auto it = CompileCache.find(std::string(pattern));
+        if (it != CompileCache.end()) {
+            addr = it->second.Addr;
+        }
+    }
+
+    if (addr != 0) {
+        // JIT function signature: int match(const char* input, int* start_out, int* end_out)
+        auto Func = (int (*)(const char*, int*, int*))(uintptr_t)addr;
+        int start = -1, end = -1;
+        int matched = Func(cstr, &start, &end);
+        
+        res.matched = matched;
+        res.start = start;
+        res.end = end;
+    } else {
+        res.matched = -1;
+    }
+
+    // Release the acquired ref
+    regjit_release(pattern);
+
+    return res;
+}
+
 int regjit_match(const char* pattern, const char* buf, size_t len) {
-  // Our generated function expects null-terminated C string; ensure termination
-  // For performance we avoid copying if buf[len]==0; otherwise copy to temp buffer
-  bool need_copy = false;
-  if (len == 0 || buf[len-1] != '\0') need_copy = true;
-  std::string tmp;
-  const char* cstr = nullptr;
-  if (need_copy) {
-    tmp.assign(buf, len);
-    tmp.push_back('\0');
-    cstr = tmp.c_str();
-  } else {
-    cstr = buf;
-  }
-   if (!pattern) return -1;
+    // Legacy API: executes search behavior but returns simple int status
+    // Fixed to use correct JIT function signature to avoid crashes
+    regjit_match_result res = execute_jit_func(pattern, buf, len);
+    return res.matched;
+}
 
-   // Acquire the compiled pattern to ensure it isn't evicted while executing
-   char* err = nullptr;
-   if (!regjit_acquire(pattern, &err)) {
-     if (err) free(err);
-     return -1;
-   }
+regjit_match_result regjit_match_at_start(const char* pattern, const char* buf, size_t len) {
+    regjit_match_result res = execute_jit_func(pattern, buf, len);
+    // Enforce anchor at start logic
+    if (res.matched == 1) {
+        if (res.start != 0) {
+            // Found a match but not at start
+            res.matched = 0;
+            res.start = -1;
+            res.end = -1;
+        }
+    }
+    return res;
+}
 
-   // Find the compiled entry and call its function pointer (Addr)
-   uint64_t addr = 0;
-   {
-     std::lock_guard<std::mutex> lk(CompileCacheMutex);
-     auto it = CompileCache.find(std::string(pattern));
-     if (it != CompileCache.end()) {
-       addr = it->second.Addr;
-     }
-   }
-
-   int result = -1;
-   if (addr != 0) {
-     auto Func = (int (*)(const char*))(uintptr_t)addr;
-     result = Func(cstr);
-   }
-
-   // Release the acquired ref
-   regjit_release(pattern);
-
-   return result;
+regjit_match_result regjit_search(const char* pattern, const char* buf, size_t len) {
+    return execute_jit_func(pattern, buf, len);
 }
 
 void regjit_unload(const char* pattern) {
@@ -646,9 +689,12 @@ int Execute(const char* input) {
   std::string lookupName = FunctionName.empty() ? "match" : FunctionName;
   RJDBG(fprintf(stderr, "Execute(): FunctionName='%s' lookupName='%s'\n", FunctionName.c_str(), lookupName.c_str()));
   auto MatchSym = ExitOnErr(JIT->lookup(lookupName));
-  auto Func = (int (*)(const char*))MatchSym.getValue();
+  
+  // Updated signature to match JIT: int match(const char* input, int* start_out, int* end_out)
+  auto Func = (int (*)(const char*, int*, int*))MatchSym.getValue();
 
-  int ResultCode = Func(input);
+  int start = -1, end = -1;
+  int ResultCode = Func(input, &start, &end);
   outs() << "\nProgram exited with code: " << ResultCode << "\n";
   return ResultCode;
 }
@@ -659,16 +705,27 @@ int Execute(const char* input) {
 // This search loop (and the logic below) is essential for correct zero-width anchor + quantifier compatibility. DO NOT REMOVE/REFRACTOR this loop unless you re-run all anchor/quant edge tests against PCRE/RE2.
 //
 Value* Func::CodeGen() {
+    // New function signature: int match(const char* input, int* start_out, int* end_out)
+    // Returns 1 on match, 0 on no match
+    // start_out and end_out are written with match positions (or -1 if no match)
+    Type* i8ptrTy = PointerType::get(Builder.getInt8Ty(), 0);
+    Type* i32ptrTy = PointerType::get(Builder.getInt32Ty(), 0);
+    
     FunctionType *matchFuncType = FunctionType::get(
         Builder.getInt32Ty(), 
-        {PointerType::get(Builder.getInt8Ty(), 0)},
+        {i8ptrTy, i32ptrTy, i32ptrTy},  // input, start_out, end_out
         false
     );
     MatchF = Function::Create(
         matchFuncType, Function::ExternalLinkage, FunctionName, ThisModule.get());
 
-    Arg0 = MatchF->arg_begin();
+    auto argIt = MatchF->arg_begin();
+    Arg0 = argIt++;
     Arg0->setName(FunArgName);
+    StartOutArg = argIt++;
+    StartOutArg->setName("start_out");
+    EndOutArg = argIt++;
+    EndOutArg->setName("end_out");
 
     // Create entry block and index variable
     BasicBlock *EntryBB = BasicBlock::Create(Context, "entry", MatchF);
@@ -676,11 +733,14 @@ Value* Func::CodeGen() {
     Index = Builder.CreateAlloca(Builder.getInt32Ty());
     Builder.CreateStore(ConstantInt::get(Context, APInt(32, 0)), Index);
     
+    // Alloca to save match start position
+    MatchStartAlloca = Builder.CreateAlloca(Builder.getInt32Ty());
+    Builder.CreateStore(ConstantInt::get(Context, APInt(32, 0)), MatchStartAlloca);
+    
     // Compute string length using libc strlen (with direct function pointer)
     // This is much faster than the inline loop for long strings
     StrLenAlloca = Builder.CreateAlloca(Builder.getInt32Ty());
     
-    Type* i8ptrTy = PointerType::get(Builder.getInt8Ty(), 0);
     Type* sizeTy = Builder.getInt64Ty();
     
     // Get strlen function pointer directly
@@ -716,6 +776,8 @@ Value* Func::CodeGen() {
         
         // Ensure index is 0 and emit a single attempt
         Builder.CreateStore(ConstantInt::get(Context, APInt(32, 0)), Index);
+        // Save match start position (always 0 for anchored patterns)
+        Builder.CreateStore(ConstantInt::get(Context, APInt(32, 0)), MatchStartAlloca);
         // Trace attempt at idx=0
         {
           Type* i8ptrTy = PointerType::get(Builder.getInt8Ty(), 0);
@@ -773,7 +835,22 @@ Value* Func::CodeGen() {
             
             // Check if BMH found anything (returns nullptr if not found)
             Value* isNull = Builder.CreateICmpEQ(foundPtr, ConstantPointerNull::get(cast<PointerType>(i8ptrTy)));
-            Builder.CreateCondBr(isNull, ReturnFailBB, ReturnSuccessBB);
+            
+            // Create block to handle BMH success - calculate and save match positions
+            BasicBlock *BmhSuccessBB = BasicBlock::Create(Context, "bmh_success", MatchF);
+            Builder.CreateCondBr(isNull, ReturnFailBB, BmhSuccessBB);
+            
+            Builder.SetInsertPoint(BmhSuccessBB);
+            // Calculate match start: foundPtr - Arg0
+            Value* foundPtrInt = Builder.CreatePtrToInt(foundPtr, sizeTy);
+            Value* arg0PtrInt = Builder.CreatePtrToInt(Arg0, sizeTy);
+            Value* matchStartLong = Builder.CreateSub(foundPtrInt, arg0PtrInt);
+            Value* matchStart = Builder.CreateTrunc(matchStartLong, Builder.getInt32Ty());
+            Builder.CreateStore(matchStart, MatchStartAlloca);
+            // Match end = start + pattern length
+            Value* matchEnd = Builder.CreateAdd(matchStart, ConstantInt::get(Builder.getInt32Ty(), literalPrefix.length()));
+            Builder.CreateStore(matchEnd, Index);
+            Builder.CreateBr(ReturnSuccessBB);
             
         } else if (firstLiteralChar >= 0) {
             // === MEMCHR OPTIMIZATION PATH ===
@@ -826,6 +903,8 @@ Value* Func::CodeGen() {
             
             Value *curIdx_search = Builder.CreateLoad(Builder.getInt32Ty(), Index);
             Builder.CreateStore(curIdx_search, Index);
+            // Save match start position before attempting match
+            Builder.CreateStore(curIdx_search, MatchStartAlloca);
             
             Body->SetFailBlock(TryFail);
             Body->SetSuccessBlock(TrySuccess);
@@ -987,9 +1066,17 @@ Value* Func::CodeGen() {
 
     // Define the actual return blocks
     Builder.SetInsertPoint(ReturnSuccessBB);
+    // Write match positions to output parameters
+    Value* matchStart = Builder.CreateLoad(Builder.getInt32Ty(), MatchStartAlloca);
+    Value* matchEnd = Builder.CreateLoad(Builder.getInt32Ty(), Index);
+    Builder.CreateStore(matchStart, StartOutArg);
+    Builder.CreateStore(matchEnd, EndOutArg);
     Builder.CreateRet(ConstantInt::get(Context, APInt(32, 1)));
     
     Builder.SetInsertPoint(ReturnFailBB);
+    // Write -1 to indicate no match
+    Builder.CreateStore(ConstantInt::get(Context, APInt(32, -1)), StartOutArg);
+    Builder.CreateStore(ConstantInt::get(Context, APInt(32, -1)), EndOutArg);
     Builder.CreateRet(ConstantInt::get(Context, APInt(32, 0)));
     
     // Reset the global context/builder pointers after all IR generation is done
@@ -1241,6 +1328,10 @@ Value* Repeat::CodeGen() {
         BasicBlock* failRestore = BasicBlock::Create(Context, "repeat_fail_restore", MatchF);
         if (nonGreedy) {
             // Non-greedy: first try to exit, then try to match
+            // FIX: Set success/fail blocks for Body even if we jump to success first,
+            // because Body->CodeGen() is called below and expects them.
+            Body->SetSuccessBlock(checkBlock);
+            Body->SetFailBlock(GetFailBlock()); // If match fails in non-greedy, it's a hard fail for this branch
             Builder.CreateCondBr(Builder.getTrue(), GetSuccessBlock(), bodyBlock);
         } else {
             // Greedy: first try to match, then exit on failure
@@ -1518,10 +1609,6 @@ public:
                     return {CHAR, c};
                 }
                 default:
-                    if (isspace(current())) {
-                        next();
-                        continue;
-                    }
                     char c = current();
                     next();
                     return {CHAR, c};
@@ -1613,14 +1700,14 @@ class RegexParser {
                 m_cur_token = m_lexer.get_next_token();
                 auto expr = parse_expr();
                 if (m_cur_token.type != RegexLexer::RPAREN) {
-                    throw std::runtime_error("Mismatched parentheses");
+                    throw std::runtime_error("missing ), unterminated subpattern at position 0");
                 }
                 m_cur_token = m_lexer.get_next_token();
                 return expr;
             } else {
                 auto expr = parse_expr();
                 if (m_cur_token.type != RegexLexer::RPAREN) {
-                    throw std::runtime_error("Mismatched parentheses");
+                    throw std::runtime_error("missing ), unterminated subpattern at position 0");
                 }
                 m_cur_token = m_lexer.get_next_token();
                 return expr;
@@ -1801,8 +1888,10 @@ class RegexParser {
                         nongreedy = true;
                         m_cur_token = m_lexer.get_next_token();
                     }
-                    if (min < 0 || (max >= 0 && max < min))
-                        throw std::runtime_error("Malformed quantifier: nonsensical range");
+                    if (min < 0)
+                        throw std::runtime_error("Malformed quantifier: expected digit after '{'");
+                    if (max >= 0 && max < min)
+                        throw std::runtime_error("Malformed quantifier: min repeat greater than max repeat");
                     node = Repeat::makeRange(std::move(node), min, max, nongreedy);
                     break;
                 }
@@ -1812,28 +1901,32 @@ class RegexParser {
         }
     }
 
+    // Check whether the current token can start a new element.
+    bool can_start_element() const {
+        switch (m_cur_token.type) {
+            case RegexLexer::CHAR:
+            case RegexLexer::LPAREN:
+            case RegexLexer::DOT:
+            case RegexLexer::LBRACKET:
+            case RegexLexer::CARET:
+            case RegexLexer::DOLLAR:
+            case RegexLexer::WORD_BOUNDARY:
+            case RegexLexer::NON_WORD_BOUNDARY:
+            case RegexLexer::DIGIT_CLASS:
+            case RegexLexer::NON_DIGIT_CLASS:
+            case RegexLexer::WORD_CLASS:
+            case RegexLexer::NON_WORD_CLASS:
+            case RegexLexer::SPACE_CLASS:
+            case RegexLexer::NON_SPACE_CLASS:
+                return true;
+            default:
+                return false;
+        }
+    }
+
     std::unique_ptr<Root> parse_concat() {
         auto left = parse_postfix();
-    // Continue concatenation while next token can start an element. This
-    // includes CHAR, group '(', dot '.', character class '[', anchor
-    // tokens (^, $, \b, \B), and escape class tokens (\d, \D, \w, \W, \s, \S).
-    // Previous implementation only checked for CHAR or LPAREN which caused
-    // trailing anchors (like '$') to be left unconsumed and dropped from AST.
-    while (m_cur_token.type == RegexLexer::CHAR ||
-           m_cur_token.type == RegexLexer::LPAREN ||
-           m_cur_token.type == RegexLexer::DOT ||
-           m_cur_token.type == RegexLexer::LBRACKET ||
-           m_cur_token.type == RegexLexer::CARET ||
-           m_cur_token.type == RegexLexer::DOLLAR ||
-           m_cur_token.type == RegexLexer::WORD_BOUNDARY ||
-           m_cur_token.type == RegexLexer::NON_WORD_BOUNDARY ||
-           // Escape sequence character classes
-           m_cur_token.type == RegexLexer::DIGIT_CLASS ||
-           m_cur_token.type == RegexLexer::NON_DIGIT_CLASS ||
-           m_cur_token.type == RegexLexer::WORD_CLASS ||
-           m_cur_token.type == RegexLexer::NON_WORD_CLASS ||
-           m_cur_token.type == RegexLexer::SPACE_CLASS ||
-           m_cur_token.type == RegexLexer::NON_SPACE_CLASS) {
+        while (can_start_element()) {
             auto right = parse_postfix();
             auto concat = std::make_unique<Concat>();
             concat->Append(std::move(left));
@@ -1843,11 +1936,31 @@ class RegexParser {
         return left;
     }
 
+    // Check whether the current token position represents a valid
+    // empty alternative branch (PIPE, RPAREN, or EOS follow).
+    bool at_empty_branch() const {
+        return m_cur_token.type == RegexLexer::PIPE ||
+               m_cur_token.type == RegexLexer::RPAREN ||
+               m_cur_token.type == RegexLexer::EOS;
+    }
+
     std::unique_ptr<Root> parse_expr() {
-        auto left = parse_concat();
+        // The first branch may be empty when the expression starts
+        // with '|' (e.g. "|a") or the group is "(|)".
+        std::unique_ptr<Root> left;
+        if (at_empty_branch()) {
+            left = std::make_unique<Concat>();  // empty branch
+        } else {
+            left = parse_concat();
+        }
         while (m_cur_token.type == RegexLexer::PIPE) {
             m_cur_token = m_lexer.get_next_token();
-            auto right = parse_concat();
+            std::unique_ptr<Root> right;
+            if (at_empty_branch()) {
+                right = std::make_unique<Concat>();  // empty branch
+            } else {
+                right = parse_concat();
+            }
             auto alt = std::make_unique<Alternative>();
             alt->Append(std::move(left));
             alt->Append(std::move(right));
@@ -1861,7 +1974,15 @@ public:
         : m_lexer(lexer), m_cur_token(lexer.get_next_token()) {}
 
     std::unique_ptr<Root> parse() {
-        return parse_expr();
+        auto result = parse_expr();
+        // After parsing, verify all input was consumed
+        if (m_cur_token.type != RegexLexer::EOS) {
+            if (m_cur_token.type == RegexLexer::RPAREN) {
+                throw std::runtime_error("unbalanced parenthesis");
+            }
+            throw std::runtime_error("Unexpected token");
+        }
+        return result;
     }
 };
 
@@ -1890,14 +2011,12 @@ Value* CharClass::CodeGen() {
     
     Value* finalMatch = nullptr;
     
-    // For dot (.) class, match any character except newline
+    // For dot (.) class, match any character except \n
+    // Python re: . matches \r but NOT \n (unless re.DOTALL)
     if (dotClass) {
         Value* isNewline = Builder.CreateICmpEQ(currentChar, 
             ConstantInt::get(Context, APInt(32, '\n')));
-        Value* isCarriageReturn = Builder.CreateICmpEQ(currentChar, 
-            ConstantInt::get(Context, APInt(32, '\r')));
-        Value* isLineEnd = Builder.CreateOr(isNewline, isCarriageReturn);
-        finalMatch = Builder.CreateNot(isLineEnd);
+        finalMatch = Builder.CreateNot(isNewline);
     } else {
         // For regular character classes, check each range
         for (const auto& range : ranges) {
@@ -1968,37 +2087,18 @@ Value* Anchor::CodeGen() {
         }
         case WordBoundary: {
             // \b matches at word boundaries (transition between \w and \W)
-            // Check if current position is at string boundaries
-            // Use precomputed inline strlen value
+            // Correct semantics:
+            // - At position 0: TRUE if str[0] is a word char (non-word -> word transition)
+            // - At position strlen: TRUE if str[strlen-1] is a word char (word -> non-word transition)
+            // - Middle positions: TRUE if isWordChar(str[i-1]) XOR isWordChar(str[i])
+            
             Value* strLen = Builder.CreateLoad(Builder.getInt32Ty(), StrLenAlloca);
-
+            
             Value* atStart = Builder.CreateICmpEQ(curIdx, 
                 ConstantInt::get(Context, APInt(32, 0)));
             Value* atEnd = Builder.CreateICmpEQ(curIdx, strLen);
-            Value* atBoundary = Builder.CreateOr(atStart, atEnd);
             
-            // If not at boundary, check character transition
-            BasicBlock* checkTransition = BasicBlock::Create(Context, "check_transition", MatchF);
-            BasicBlock* endCheck = BasicBlock::Create(Context, "end_check", MatchF);
-            
-            BasicBlock* currentBlock = Builder.GetInsertBlock();
-            Builder.CreateCondBr(atBoundary, endCheck, checkTransition);
-            
-            // Check character transition
-            Builder.SetInsertPoint(checkTransition);
-            
-            // Get current character
-            Value* curCharPtr = Builder.CreateGEP(Builder.getInt8Ty(), Arg0, curIdx);
-            Value* curChar = Builder.CreateLoad(Builder.getInt8Ty(), curCharPtr);
-            curChar = Builder.CreateIntCast(curChar, Builder.getInt32Ty(), false);
-            
-            // Get previous character
-            Value* prevIdx = Builder.CreateSub(curIdx, ConstantInt::get(Context, APInt(32, 1)));
-            Value* prevCharPtr = Builder.CreateGEP(Builder.getInt8Ty(), Arg0, prevIdx);
-            Value* prevChar = Builder.CreateLoad(Builder.getInt8Ty(), prevCharPtr);
-            prevChar = Builder.CreateIntCast(prevChar, Builder.getInt32Ty(), false);
-            
-            // Check if characters are word characters (\w = [a-zA-Z0-9_])
+            // Helper lambda to check if a character is a word character
             auto isWordChar = [&](Value* ch) -> Value* {
                 Value* isLower = Builder.CreateAnd(
                     Builder.CreateICmpUGE(ch, ConstantInt::get(Context, APInt(32, 'a'))),
@@ -2018,64 +2118,90 @@ Value* Anchor::CodeGen() {
                 return Builder.CreateOr(Builder.CreateOr(Builder.CreateOr(isLower, isUpper), isDigit), isUnderscore);
             };
             
-            Value* curIsWord = isWordChar(curChar);
-            Value* prevIsWord = isWordChar(prevChar);
+            // Create basic blocks for different cases
+            BasicBlock* checkStartBlock = BasicBlock::Create(Context, "wb_check_start", MatchF);
+            BasicBlock* checkEndBlock = BasicBlock::Create(Context, "wb_check_end", MatchF);
+            BasicBlock* checkMiddleBlock = BasicBlock::Create(Context, "wb_check_middle", MatchF);
+            BasicBlock* endCheck = BasicBlock::Create(Context, "wb_end_check", MatchF);
             
-            // Word boundary: one is word char, the other is not
-            Value* isBoundary = Builder.CreateXor(curIsWord, prevIsWord);
+            // Branch: if at start, check first char; else check if at end
+            Builder.CreateCondBr(atStart, checkStartBlock, checkEndBlock);
             
+            // At string start (position 0): boundary if first char is a word char
+            Builder.SetInsertPoint(checkStartBlock);
+            Value* isEmpty = Builder.CreateICmpEQ(strLen, ConstantInt::get(Context, APInt(32, 0)));
+            // If string is empty, no boundary at position 0
+            Value* firstCharPtr = Builder.CreateGEP(Builder.getInt8Ty(), Arg0, 
+                ConstantInt::get(Context, APInt(32, 0)));
+            Value* firstChar = Builder.CreateLoad(Builder.getInt8Ty(), firstCharPtr);
+            firstChar = Builder.CreateIntCast(firstChar, Builder.getInt32Ty(), false);
+            Value* firstIsWord = isWordChar(firstChar);
+            // Boundary at start = first char is word AND string is not empty
+            Value* boundaryAtStart = Builder.CreateAnd(firstIsWord, Builder.CreateNot(isEmpty));
             Builder.CreateBr(endCheck);
             
-// Combine results
+            // Check if at end
+            Builder.SetInsertPoint(checkEndBlock);
+            Builder.CreateCondBr(atEnd, checkMiddleBlock, checkMiddleBlock);
+            // Note: We handle atEnd inside checkMiddleBlock to avoid code duplication
+            
+            // Handle both middle positions and end position
+            Builder.SetInsertPoint(checkMiddleBlock);
+            // At string end (position strlen): boundary if last char is a word char
+            // At middle positions: boundary if prev XOR cur
+            
+            // For end position: check str[strlen-1]
+            Value* lastIdx = Builder.CreateSub(strLen, ConstantInt::get(Context, APInt(32, 1)));
+            Value* lastCharPtr = Builder.CreateGEP(Builder.getInt8Ty(), Arg0, lastIdx);
+            Value* lastChar = Builder.CreateLoad(Builder.getInt8Ty(), lastCharPtr);
+            lastChar = Builder.CreateIntCast(lastChar, Builder.getInt32Ty(), false);
+            Value* lastIsWord = isWordChar(lastChar);
+            
+            // For middle positions: check transition
+            Value* prevIdx = Builder.CreateSub(curIdx, ConstantInt::get(Context, APInt(32, 1)));
+            Value* prevCharPtr = Builder.CreateGEP(Builder.getInt8Ty(), Arg0, prevIdx);
+            Value* prevChar = Builder.CreateLoad(Builder.getInt8Ty(), prevCharPtr);
+            prevChar = Builder.CreateIntCast(prevChar, Builder.getInt32Ty(), false);
+            
+            Value* curCharPtr = Builder.CreateGEP(Builder.getInt8Ty(), Arg0, curIdx);
+            Value* curChar = Builder.CreateLoad(Builder.getInt8Ty(), curCharPtr);
+            curChar = Builder.CreateIntCast(curChar, Builder.getInt32Ty(), false);
+            
+            Value* curIsWord = isWordChar(curChar);
+            Value* prevIsWord = isWordChar(prevChar);
+            Value* middleBoundary = Builder.CreateXor(curIsWord, prevIsWord);
+            
+            // Select result based on whether we're at end or middle
+            // atEnd (in this block) means curIdx == strLen
+            Value* atEndHere = Builder.CreateICmpEQ(curIdx, strLen);
+            Value* boundaryAtMiddleOrEnd = Builder.CreateSelect(atEndHere, lastIsWord, middleBoundary);
+            Builder.CreateBr(endCheck);
+            
+            // Combine results with PHI
             Builder.SetInsertPoint(endCheck);
             PHINode* result = Builder.CreatePHI(Builder.getInt1Ty(), 2);
-            result->addIncoming(ConstantInt::get(Context, APInt(1, 1)), currentBlock);
-            result->addIncoming(isBoundary, checkTransition);
+            result->addIncoming(boundaryAtStart, checkStartBlock);
+            result->addIncoming(boundaryAtMiddleOrEnd, checkMiddleBlock);
             
             match = result;
             break;
         }
         case NonWordBoundary: {
-            // \B matches at non-word boundaries
-            // This is the negation of \b
-            // Use precomputed inline strlen value
+            // \B matches at non-word boundaries (NO transition between \w and \W)
+            // Correct semantics (inverse of \b):
+            // - At position 0: TRUE if str[0] is NOT a word char (non-word -> non-word)
+            // - At position strlen: TRUE if str[strlen-1] is NOT a word char (non-word -> non-word)
+            // - Middle positions: TRUE if isWordChar(str[i-1]) == isWordChar(str[i]) (no transition)
+            // - Special case: empty string at position 0 is \B (both sides are non-word)
+            
             Value* strLen = Builder.CreateLoad(Builder.getInt32Ty(), StrLenAlloca);
-
+            
             Value* atStart = Builder.CreateICmpEQ(curIdx, 
                 ConstantInt::get(Context, APInt(32, 0)));
             Value* atEnd = Builder.CreateICmpEQ(curIdx, strLen);
-            Value* atBoundary = Builder.CreateOr(atStart, atEnd);
-            
-            // Special case: at string start/end with empty string (strLen == 0),
-            // the position is non-word-to-non-word (both imaginary), so \B succeeds
             Value* isEmpty = Builder.CreateICmpEQ(strLen, ConstantInt::get(Context, APInt(32, 0)));
             
-            // If at real boundary (non-empty string), fail immediately
-            // If at empty string boundary, succeed
-            // Otherwise check character transition
-            BasicBlock* boundaryBlock = Builder.GetInsertBlock();  // Capture the block before branching
-            BasicBlock* checkTransition = BasicBlock::Create(Context, "check_nonword_transition", MatchF);
-            BasicBlock* endCheck = BasicBlock::Create(Context, "end_nonword_check", MatchF);
-            
-            // Branch: if (atBoundary && !isEmpty) goto endCheck with false, else goto checkTransition
-            Value* realBoundary = Builder.CreateAnd(atBoundary, Builder.CreateNot(isEmpty));
-            Builder.CreateCondBr(realBoundary, endCheck, checkTransition);
-            
-            // Check character transition (same as \b but negated)
-            Builder.SetInsertPoint(checkTransition);
-            
-            // Get current character
-            Value* curCharPtr = Builder.CreateGEP(Builder.getInt8Ty(), Arg0, curIdx);
-            Value* curChar = Builder.CreateLoad(Builder.getInt8Ty(), curCharPtr);
-            curChar = Builder.CreateIntCast(curChar, Builder.getInt32Ty(), false);
-            
-            // Get previous character
-            Value* prevIdx = Builder.CreateSub(curIdx, ConstantInt::get(Context, APInt(32, 1)));
-            Value* prevCharPtr = Builder.CreateGEP(Builder.getInt8Ty(), Arg0, prevIdx);
-            Value* prevChar = Builder.CreateLoad(Builder.getInt8Ty(), prevCharPtr);
-            prevChar = Builder.CreateIntCast(prevChar, Builder.getInt32Ty(), false);
-            
-            // Check if characters are word characters
+            // Helper lambda to check if a character is a word character
             auto isWordChar = [&](Value* ch) -> Value* {
                 Value* isLower = Builder.CreateAnd(
                     Builder.CreateICmpUGE(ch, ConstantInt::get(Context, APInt(32, 'a'))),
@@ -2095,25 +2221,72 @@ Value* Anchor::CodeGen() {
                 return Builder.CreateOr(Builder.CreateOr(Builder.CreateOr(isLower, isUpper), isDigit), isUnderscore);
             };
             
+            // Create basic blocks for different cases
+            BasicBlock* checkStartBlock = BasicBlock::Create(Context, "nwb_check_start", MatchF);
+            BasicBlock* checkEndBlock = BasicBlock::Create(Context, "nwb_check_end", MatchF);
+            BasicBlock* checkMiddleBlock = BasicBlock::Create(Context, "nwb_check_middle", MatchF);
+            BasicBlock* endCheck = BasicBlock::Create(Context, "nwb_end_check", MatchF);
+            
+            // Branch: if at start, check first char; else check if at end
+            Builder.CreateCondBr(atStart, checkStartBlock, checkEndBlock);
+            
+            // At string start (position 0): non-boundary if first char is NOT a word char OR string is empty
+            Builder.SetInsertPoint(checkStartBlock);
+            Value* firstCharPtr = Builder.CreateGEP(Builder.getInt8Ty(), Arg0, 
+                ConstantInt::get(Context, APInt(32, 0)));
+            Value* firstChar = Builder.CreateLoad(Builder.getInt8Ty(), firstCharPtr);
+            firstChar = Builder.CreateIntCast(firstChar, Builder.getInt32Ty(), false);
+            Value* firstIsWord = isWordChar(firstChar);
+            // Non-boundary at start = first char is NOT word OR string is empty
+            Value* nonBoundaryAtStart = Builder.CreateOr(Builder.CreateNot(firstIsWord), isEmpty);
+            Builder.CreateBr(endCheck);
+            
+            // Check if at end
+            Builder.SetInsertPoint(checkEndBlock);
+            Builder.CreateCondBr(atEnd, checkMiddleBlock, checkMiddleBlock);
+            // Note: We handle atEnd inside checkMiddleBlock to avoid code duplication
+            
+            // Handle both middle positions and end position
+            Builder.SetInsertPoint(checkMiddleBlock);
+            
+            // For end position: check str[strlen-1] - non-boundary if last char is NOT word
+            Value* lastIdx = Builder.CreateSub(strLen, ConstantInt::get(Context, APInt(32, 1)));
+            Value* lastCharPtr = Builder.CreateGEP(Builder.getInt8Ty(), Arg0, lastIdx);
+            Value* lastChar = Builder.CreateLoad(Builder.getInt8Ty(), lastCharPtr);
+            lastChar = Builder.CreateIntCast(lastChar, Builder.getInt32Ty(), false);
+            Value* lastIsWord = isWordChar(lastChar);
+            Value* nonBoundaryAtEnd = Builder.CreateNot(lastIsWord);
+            
+            // For middle positions: check NO transition (both word or both non-word)
+            Value* prevIdx = Builder.CreateSub(curIdx, ConstantInt::get(Context, APInt(32, 1)));
+            Value* prevCharPtr = Builder.CreateGEP(Builder.getInt8Ty(), Arg0, prevIdx);
+            Value* prevChar = Builder.CreateLoad(Builder.getInt8Ty(), prevCharPtr);
+            prevChar = Builder.CreateIntCast(prevChar, Builder.getInt32Ty(), false);
+            
+            Value* curCharPtr = Builder.CreateGEP(Builder.getInt8Ty(), Arg0, curIdx);
+            Value* curChar = Builder.CreateLoad(Builder.getInt8Ty(), curCharPtr);
+            curChar = Builder.CreateIntCast(curChar, Builder.getInt32Ty(), false);
+            
             Value* curIsWord = isWordChar(curChar);
             Value* prevIsWord = isWordChar(prevChar);
             
-            // Non-word boundary: both are word chars or both are non-word chars
+            // Non-boundary: both are word chars OR both are non-word chars (no XOR)
             Value* bothWord = Builder.CreateAnd(curIsWord, prevIsWord);
             Value* bothNonWord = Builder.CreateAnd(Builder.CreateNot(curIsWord), Builder.CreateNot(prevIsWord));
-            Value* isNonBoundary = Builder.CreateOr(bothWord, bothNonWord);
+            Value* middleNonBoundary = Builder.CreateOr(bothWord, bothNonWord);
             
-              Builder.CreateBr(endCheck);
-              
-              // Combine results
-              Builder.SetInsertPoint(endCheck);
-              PHINode* result = Builder.CreatePHI(Builder.getInt1Ty(), 2);
-              // Real boundary (non-empty string): fail
-              result->addIncoming(ConstantInt::get(Context, APInt(1, 0)), boundaryBlock);
-              // Character transition check result (or empty string case which goes through checkTransition)
-              result->addIncoming(isNonBoundary, checkTransition);
-              
-              match = result;
+            // Select result based on whether we're at end or middle
+            Value* atEndHere = Builder.CreateICmpEQ(curIdx, strLen);
+            Value* nonBoundaryAtMiddleOrEnd = Builder.CreateSelect(atEndHere, nonBoundaryAtEnd, middleNonBoundary);
+            Builder.CreateBr(endCheck);
+            
+            // Combine results with PHI
+            Builder.SetInsertPoint(endCheck);
+            PHINode* result = Builder.CreatePHI(Builder.getInt1Ty(), 2);
+            result->addIncoming(nonBoundaryAtStart, checkStartBlock);
+            result->addIncoming(nonBoundaryAtMiddleOrEnd, checkMiddleBlock);
+            
+            match = result;
             break;
         }
     }

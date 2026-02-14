@@ -88,6 +88,9 @@ test_group: tests/test_group.cpp $(REGJIT_OBJ)
 test_syntax: tests/test_syntax.cpp $(REGJIT_OBJ)
 	$(CXX) $(CXXFLAGS) -I./src -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
+test_python_re_compat: tests/test_python_re_compat.cpp $(REGJIT_OBJ)
+	$(CXX) $(CXXFLAGS) -I./src -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
 simple_anchor_test: tests/simple_anchor_test.cpp $(REGJIT_OBJ)
 	$(CXX) $(CXXFLAGS) -I./src -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
@@ -119,7 +122,7 @@ test_wrong: tests/test_wrong.cpp $(REGJIT_OBJ)
 	$(CXX) $(CXXFLAGS) -I./src -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
 # Run all tests in tests directory
-test_all: test_charclass test_anchor test_quantifier test_escape test_anchor_quant_edge test_cleanup simple_anchor_test test_group test_syntax
+test_all: test_charclass test_anchor test_quantifier test_escape test_anchor_quant_edge test_cleanup simple_anchor_test test_group test_syntax test_python_re_compat
 	@echo "Running all tests in tests/ directory..."
 	@if [ -f test_charclass ]; then echo "=== Running test_charclass ==="; ./test_charclass || echo "test_charclass failed"; fi
 	@if [ -f test_anchor ]; then echo "=== Running test_anchor ==="; timeout 3 ./test_anchor || echo "test_anchor failed or timed out"; fi
@@ -130,6 +133,7 @@ test_all: test_charclass test_anchor test_quantifier test_escape test_anchor_qua
 	@if [ -f simple_anchor_test ]; then echo "=== Running simple_anchor_test ==="; ./simple_anchor_test || echo "simple_anchor_test failed"; fi
 	@if [ -f test_group ]; then echo "=== Running test_group ==="; timeout 10 ./test_group || echo "test_group failed or timed out"; fi
 	@if [ -f test_syntax ]; then echo "=== Running test_syntax ==="; timeout 10 ./test_syntax || echo "test_syntax failed or timed out"; fi
+	@if [ -f test_python_re_compat ]; then echo "=== Running test_python_re_compat ==="; timeout 30 ./test_python_re_compat || echo "test_python_re_compat failed or timed out"; fi
 	@echo "All tests completed!"
 
 bench: src/benchmark.cpp src/regjit.o

@@ -39,8 +39,10 @@ def test_anchors():
     # $ 行尾锚点
     r_end = Regex("abc$")
     assert r_end.match("abc"), "'abc$' should match 'abc'"
-    assert r_end.match("xabc"), "'abc$' should match 'xabc'"
-    assert not r_end.match("abcx"), "'abc$' should not match 'abcx'"
+    # match is anchored at start, so "abc$" applied to "xabc" fails at start.
+    # search should find it.
+    assert not r_end.match("xabc"), "'abc$' should not match 'xabc' using match()"
+    assert r_end.search("xabc"), "'abc$' should match 'xabc' using search()"
 
 
 def test_alternation():
@@ -66,6 +68,34 @@ def test_quantifiers():
     assert not r_qmark.match("abbc"), "'ab?c' should not match 'abbc'"
 
 
+def test_search_vs_match():
+    """Test search vs match distinction"""
+    r = Regex("abc")
+    # match is anchored
+    assert r.match("abc")
+    assert not r.match("xabc")
+    
+    # search is unanchored
+    assert r.search("abc")
+    assert r.search("xabc")
+    assert not r.search("ac")
+
+
+def test_match_object():
+    """Test Match object attributes"""
+    r = Regex("abc")
+    m = r.search("xabcy")
+    assert m, "Should match"
+    assert m.start() == 1
+    assert m.end() == 4
+    assert m.span() == (1, 4)
+    # Check truthiness
+    if m:
+        pass
+    else:
+        assert False, "Match object should be truthy"
+
+
 if __name__ == "__main__":
     test_basic_match()
     print("test_basic_match passed")
@@ -78,5 +108,11 @@ if __name__ == "__main__":
 
     test_quantifiers()
     print("test_quantifiers passed")
+    
+    test_search_vs_match()
+    print("test_search_vs_match passed")
+
+    test_match_object()
+    print("test_match_object passed")
 
     print("\nAll Python binding tests passed!")

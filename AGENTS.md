@@ -656,6 +656,51 @@ Value* Not::CodeGen() {
 - [ ] `make clean && make REGJIT_DEBUG=1 test_all` - Debug 构建
 - [ ] `make RELEASE=1 bench && ./bench` - 性能基准测试
 
+### 📋 Makefile 测试目标管理规范（必须遵守）
+
+**每次新增测试文件时，必须同步更新 Makefile：**
+
+#### 1. 添加构建目标
+
+在 `Makefile` 中为测试文件添加独立的构建目标，遵循现有格式：
+
+```makefile
+test_xxx: tests/test_xxx.cpp $(REGJIT_OBJ)
+	$(CXX) $(CXXFLAGS) -I./src -o $@ $^ $(LDFLAGS) $(LDLIBS)
+```
+
+#### 2. 加入 `test_all`
+
+将新目标添加到 `test_all` 的依赖列表和运行列表中：
+
+```makefile
+# 依赖列表（第一行）
+test_all: ... test_xxx
+
+# 运行列表（追加一行）
+@if [ -f test_xxx ]; then echo "=== Running test_xxx ==="; timeout 15 ./test_xxx || echo "test_xxx failed or timed out"; fi
+```
+
+#### 3. 按需加入 `test_quick`
+
+如果测试覆盖核心功能（如语法、匹配、兼容性），也应加入 `test_quick`。
+
+#### 4. 当前测试目标清单
+
+| 目标 | 文件 | 范围 | 包含在 |
+|------|------|------|--------|
+| `test_charclass` | `tests/test_charclass.cpp` | 字符类 `[abc]` | `test_all`, `test_quick` |
+| `test_anchor` | `tests/test_anchor.cpp` | 锚点 `^$\b\B` | `test_all`, `test_quick` |
+| `test_quantifier` | `tests/test_quantifier.cpp` | 量词 `*+?{n,m}` | `test_all`, `test_quick` |
+| `test_escape` | `tests/test_escape.cpp` | 转义 `\d\w\s` | `test_all` |
+| `test_anchor_quant_edge` | `tests/test_anchor_quant_edge.cpp` | 锚点+量词拒绝 | `test_all` |
+| `test_group` | `tests/test_group.cpp` | 分组 `()(?:)` | `test_all`, `test_quick` |
+| `test_syntax` | `tests/test_syntax.cpp` | 语法错误检测 | `test_all`, `test_quick` |
+| `test_python_re_compat` | `tests/test_python_re_compat.cpp` | Python re 兼容性 | `test_all` |
+| `test_cleanup` | `tests/test_cleanup.cpp` | 清理/生命周期 | `test_all` |
+
+**反面案例**：`test_python_re_compat.cpp` 曾存在于 `tests/` 目录但未加入 Makefile，导致 CI 无法自动运行，兼容性回归未被发现。
+
 ### 🐛 性能调试技巧
 
 #### 隔离性能问题
