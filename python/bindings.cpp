@@ -25,48 +25,77 @@ public:
     }
 };
 
+// JIT function signature: int match(const char* input, int* start_out, int* end_out)
+typedef int (*JitFunc)(const char*, int*, int*);
+
 class PyRegex {
 public:
     std::string pattern;
-    PyRegex(const std::string &pat) : pattern(pat) {
+    uintptr_t func_ptr;  // Cached JIT function pointer
+    
+    PyRegex(const std::string &pat) : pattern(pat), func_ptr(0) {
         char* err = nullptr;
         if (!regjit_acquire(pat.c_str(), &err)) {
             std::string emsg = err ? std::string(err) : "acquire/compile failed";
             if (err) free(err);
             throw std::runtime_error(emsg);
         }
+        // Cache the JIT function pointer for fast matching
+        func_ptr = regjit_get_func_ptr(pat.c_str());
     }
+    
     ~PyRegex() {
         regjit_release(pattern.c_str());
     }
-
+    
+    // Fast match using cached function pointer - no acquire/release overhead
+    py::object match_str_fast(const std::string &s) {
+        if (func_ptr == 0) {
+            throw std::runtime_error("JIT function not available");
+        }
+        
+        // Ensure null termination
+        const char* cstr = s.c_str();
+        
+        JitFunc func = (JitFunc)func_ptr;
+        int start = -1, end = -1;
+        int matched = func(cstr, &start, &end);
+        
+        if (matched == 1) {
+            return py::cast(PyMatch(start, end));
+        }
+        return py::none();
+    }
+    
+    // Fast search using cached function pointer
+    py::object search_str_fast(const std::string &s) {
+        if (func_ptr == 0) {
+            throw std::runtime_error("JIT function not available");
+        }
+        
+        const char* cstr = s.c_str();
+        
+        JitFunc func = (JitFunc)func_ptr;
+        int start = -1, end = -1;
+        int matched = func(cstr, &start, &end);
+        
+        if (matched == 1) {
+            return py::cast(PyMatch(start, end));
+        }
+        return py::none();
+    }
+    
     py::object match_bytes(py::bytes b) {
         std::string s = static_cast<std::string>(b);
-        regjit_match_result r = regjit_match_at_start(pattern.c_str(), s.data(), s.size());
-        if (r.matched < 0) throw std::runtime_error("match error");
-        if (r.matched == 1) {
-            return py::cast(PyMatch(r.start, r.end));
-        }
-        return py::none();
+        return match_str_fast(s);
     }
-
+    
     py::object match_str(const std::string &s) {
-        // encode to UTF-8 bytes (std::string already holds UTF-8 in Python3)
-        regjit_match_result r = regjit_match_at_start(pattern.c_str(), s.data(), s.size());
-        if (r.matched < 0) throw std::runtime_error("match error");
-        if (r.matched == 1) {
-            return py::cast(PyMatch(r.start, r.end));
-        }
-        return py::none();
+        return match_str_fast(s);
     }
-
+    
     py::object search_str(const std::string &s) {
-        regjit_match_result r = regjit_search(pattern.c_str(), s.data(), s.size());
-        if (r.matched < 0) throw std::runtime_error("search error");
-        if (r.matched == 1) {
-            return py::cast(PyMatch(r.start, r.end));
-        }
-        return py::none();
+        return search_str_fast(s);
     }
 };
 

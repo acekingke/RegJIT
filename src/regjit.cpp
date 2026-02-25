@@ -427,6 +427,21 @@ void regjit_set_cache_maxsize(size_t n) {
   evictIfNeeded();
 }
 
+// Get raw JIT function pointer for fast matching
+uintptr_t regjit_get_func_ptr(const char* cpattern) {
+  if (!cpattern) return 0;
+  
+  std::string pattern(cpattern);
+  std::lock_guard<std::mutex> lk(CompileCacheMutex);
+  auto it = CompileCache.find(pattern);
+  if (it != CompileCache.end()) {
+    return it->second.Addr;
+  }
+  return 0;
+}
+
+// Evict entries until cache size <= CacheMaxSize. Only evict entries with refCount == 0.
+
 // Evict entries until cache size <= CacheMaxSize. Only evict entries with refCount == 0.
 void evictIfNeeded() {
   while (CompileCache.size() > CacheMaxSize) {

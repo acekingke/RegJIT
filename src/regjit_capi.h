@@ -41,6 +41,10 @@ void regjit_unload(const char* pattern);
 size_t regjit_cache_size();
 void regjit_set_cache_maxsize(size_t n);
 
+// Get raw JIT function pointer for fast matching (caller must ensure pattern stays compiled)
+// Returns function pointer address, or 0 on error
+uintptr_t regjit_get_func_ptr(const char* pattern);
+
 #ifdef __cplusplus
 }
 #endif
